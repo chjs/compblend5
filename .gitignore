@@ -41,3 +41,4 @@ transformers_cache/
 # Logs
 logs/
 *.log
+/.claude/

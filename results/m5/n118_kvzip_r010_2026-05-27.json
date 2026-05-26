@@ -1,0 +1,30 @@
+{
+  "config": {
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "dtype": "float16",
+    "attn_impl": "sdpa",
+    "kvzip_ratio": 0.1,
+    "recomp_ratio": 0.15,
+    "check_layer": 1,
+    "gate_pct": 0.5,
+    "n": 118,
+    "use_kvzip": true
+  },
+  "f1": {
+    "full_mean": 0.31563968047018903,
+    "full_n": 118,
+    "hkvd_mean": 0.0694234073876668,
+    "gated_mean": 0.0871660581694781,
+    "delta_gated_minus_hkvd_mean": 0.017742650781811333,
+    "delta_ci_95": [
+      0.0004056398679323383,
+      0.03607046363903325
+    ],
+    "delta_significant": true
+  },
+  "ttft": {
+    "full_mean": 0.5129790740522706,
+    "hkvd_mean": 0.21228572599130083,
+    "gated_mean": 0.21123033058652022
+  }
+}
