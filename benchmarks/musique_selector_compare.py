@@ -49,11 +49,70 @@ from typing import Any
 import numpy as np
 import torch
 
-# Ensure src + v7 src + bench utils are on the path.
+# Path setup. We deliberately DO NOT add cacheblend-hf-v7/benchmarks/musique
+# to sys.path: it ships a `utils.py` whose top-level name collides with
+# KVzip's `utils/` package (KVzip's `from utils.func import ...` would break).
+# The three functions we need (load_dataset, build_qa_prompt, compute_f1)
+# are inlined below.
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "src"))
 sys.path.insert(0, str(_REPO / "src" / "external" / "cacheblend-hf-v7" / "src"))
-sys.path.insert(0, str(_REPO / "src" / "external" / "cacheblend-hf-v7" / "benchmarks" / "musique"))
+
+
+# ── inlined from cacheblend-hf-v7/benchmarks/musique/utils.py ─────────────
+
+
+def _normalize_question(question: str) -> str:
+    if not question.endswith("?"):
+        question = question + "?"
+    return question[0].lower() + question[1:]
+
+
+def _parse_generation(s: str) -> str:
+    s = s.lstrip("\n").split("\n")[0]
+    if s.startswith("Yes") or s.startswith("yes"):
+        s = "Yes"
+    elif s.split() and (s.split()[0]).startswith(("No", "no")):
+        s = "No"
+    return s
+
+
+def _normalize_answer(s: str) -> str:
+    import re as _re
+    import string as _string
+    s = s.lower()
+    s = "".join(ch for ch in s if ch not in set(_string.punctuation))
+    s = _re.sub(r"\b(a|an|the)\b", " ", s)
+    return " ".join(s.split())
+
+
+def _load_dataset(path: str) -> list:
+    import json as _json
+    with open(path) as f:
+        return _json.load(f)
+
+
+def _build_qa_prompt(example: dict, query_prompt: str) -> tuple[list[str], str]:
+    q = _normalize_question(example["question"])
+    doc_prompts = [f"{c['title']}\n\n{c['text']}\n\n" for c in example["ctxs"]]
+    q_prompt = f"{query_prompt}{q}\nAnswer:"
+    return doc_prompts, q_prompt
+
+
+def _compute_f1(a_pred: str, a_gold: str, tokenizer) -> float:
+    import collections as _coll
+    a_pred = _parse_generation(a_pred)
+    gold_toks = tokenizer.encode(_normalize_answer(a_gold))[1:]
+    pred_toks = tokenizer.encode(_normalize_answer(a_pred))[1:]
+    common = _coll.Counter(gold_toks) & _coll.Counter(pred_toks)
+    num_same = sum(common.values())
+    if len(gold_toks) == 0 or len(pred_toks) == 0:
+        return float(int(gold_toks == pred_toks))
+    if num_same == 0:
+        return 0.0
+    precision = num_same / len(pred_toks)
+    recall = num_same / len(gold_toks)
+    return (2 * precision * recall) / (precision + recall)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -203,7 +262,11 @@ def main() -> int:
     from cacheblend import LayerwiseModel
     from cacheblend.kv_store import KVStore
     from cacheblend.precompute import precompute_chunk_kv
-    from utils import build_qa_prompt, compute_f1, load_dataset
+    # use inlined helpers instead of importing musique's `utils.py`
+    # (avoids name collision with KVzip's `utils/` package)
+    build_qa_prompt = _build_qa_prompt
+    compute_f1 = _compute_f1
+    load_dataset = _load_dataset
 
     print(f"[m5] model={MODEL} dtype={DTYPE} attn={ATTN_IMPL}", flush=True)
     print(f"[m5] kvzip_ratio={KVZIP_RATIO}  recomp_ratio={RECOMP_RATIO}  "

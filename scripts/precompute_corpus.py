@@ -31,11 +31,23 @@ from typing import Any
 
 import torch
 
-# Path setup — script lives under scripts/, repo root is parent.
+# Path setup — script lives under scripts/, repo root is parent. We do NOT
+# put cacheblend-hf-v7/benchmarks/musique on sys.path because its `utils.py`
+# would shadow KVzip's `utils/` package, causing
+# `from utils.func import inplace_softmax` inside KVzip to fail. Instead the
+# only function we need from there (`load_dataset`) is inlined below.
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "src"))
 sys.path.insert(0, str(_REPO / "src" / "external" / "cacheblend-hf-v7" / "src"))
-sys.path.insert(0, str(_REPO / "src" / "external" / "cacheblend-hf-v7" / "benchmarks" / "musique"))
+
+
+def _load_dataset(path: str) -> list:
+    """Inlined from cacheblend-hf-v7/benchmarks/musique/utils.py — avoids the
+    `utils` name collision with KVzip's `utils/` package."""
+    import json as _json
+    print("Loading dataset:", path)
+    with open(path) as f:
+        return _json.load(f)
 
 
 MODEL = os.environ.get("CACHEBLEND_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
@@ -56,7 +68,6 @@ def main() -> int:
     from compblend.backends.kvzip import (
         KVzipBackend, KVzipConfig, kvzip_chunk_id,
     )
-    from utils import load_dataset
 
     print(f"[precompute] model={MODEL}  ratio={KVZIP_RATIO}  level={KVZIP_LEVEL}",
           flush=True)
@@ -64,7 +75,7 @@ def main() -> int:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     dataset_path = _REPO / "src" / "external" / "cacheblend-hf-v7" / "benchmarks" / "musique" / "inputs" / "musique_s.json"
-    eval_dataset = load_dataset(str(dataset_path))
+    eval_dataset = _load_dataset(str(dataset_path))
     print(f"[precompute] {len(eval_dataset)} questions in dataset", flush=True)
 
     backend = KVzipBackend(MODEL, KVzipConfig(kv_type="retain", level=KVZIP_LEVEL))
