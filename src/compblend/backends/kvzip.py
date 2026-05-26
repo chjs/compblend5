@@ -145,11 +145,14 @@ class KVzipBackend(CompressionBackendBase):
         mk = self._get_model_kvzip()
 
         # ----- 1. Install forward hooks on every layer's k_proj + v_proj -----
-        # Captured shape: [1, full_seq, H_kv * head_dim] where full_seq =
-        # sink + ctx_len (sink = sys-prompt prepended by ModelKVzip).
-        pre_rope_k: dict[int, torch.Tensor] = {}
-        pre_v: dict[int, torch.Tensor] = {}
-        handles = self._install_hooks(mk, pre_rope_k, pre_v)
+        # KVzip's `prefill()` runs the model TWICE: first the actual prefill
+        # over [sys, content] (length = sink + ctx_len), then the scoring task
+        # (context-reconstruction) over a shorter sequence. A naive "[idx] ="
+        # hook would keep only the LAST capture (scoring) and miss prefill.
+        # Collect ALL captures per layer into a list; post-filter by shape.
+        pre_rope_k_all: dict[int, list[torch.Tensor]] = {}
+        pre_v_all: dict[int, list[torch.Tensor]] = {}
+        handles = self._install_hooks(mk, pre_rope_k_all, pre_v_all)
 
         try:
             text = self._ids_to_text(mk, input_ids)
@@ -162,7 +165,12 @@ class KVzipBackend(CompressionBackendBase):
         # ratio=1.0 → all-True mask, score still computed.
         kv.prune(ratio=budget.ratio, level=self.kvzip_config.level)
 
-        # ----- 3. Assemble CompressedChunk (slice out sys-prompt) -----
+        # ----- 3. Pick the prefill capture (shape[1] == sink + ctx_len) -----
+        sink_ctx = int(kv.sink) + int(kv.ctx_len)
+        pre_rope_k = self._select_prefill_capture(pre_rope_k_all, sink_ctx, "k_proj")
+        pre_v = self._select_prefill_capture(pre_v_all, sink_ctx, "v_proj")
+
+        # ----- 4. Assemble CompressedChunk (slice out sys-prompt) -----
         return self._build_chunk(mk, kv, pre_rope_k, pre_v, input_ids, budget)
 
     # ──────────────────────────────────────────────────────────────────────
@@ -194,14 +202,19 @@ class KVzipBackend(CompressionBackendBase):
     @staticmethod
     def _install_hooks(
         mk: Any,
-        pre_rope_k: dict[int, torch.Tensor],
-        pre_v: dict[int, torch.Tensor],
+        pre_rope_k_all: dict[int, list[torch.Tensor]],
+        pre_v_all: dict[int, list[torch.Tensor]],
     ) -> list:
-        """Hook k_proj and v_proj on every decoder layer.
+        """Hook k_proj and v_proj on every decoder layer, APPENDING every fire.
+
+        Why append instead of overwrite: KVzip's prefill triggers multiple
+        forwards (the actual prefill + a scoring task). Each forward fires
+        every layer's k_proj. A naive `dict[idx] = output` keeps only the
+        last one. We collect everything and let the caller pick the right
+        shape post-hoc.
 
         Returns a flat list of hook handles. Caller MUST remove them in a
-        finally block — leaked hooks would silently capture state on
-        unrelated forwards and could exhaust memory.
+        finally block.
         """
         # KVzip stores the HF model at mk.model; the decoder body is at
         # mk.model.model (LlamaModel / MistralModel).
@@ -213,19 +226,48 @@ class KVzipBackend(CompressionBackendBase):
 
             def make_k_hook(idx: int):
                 def hook(_module, _inputs, output):
-                    # k_proj output is pre-RoPE K. shape: (batch, seq, H_kv*D)
-                    pre_rope_k[idx] = output.detach()
+                    pre_rope_k_all.setdefault(idx, []).append(output.detach())
                 return hook
 
             def make_v_hook(idx: int):
                 def hook(_module, _inputs, output):
-                    # v_proj output. shape: (batch, seq, H_kv*D)
-                    pre_v[idx] = output.detach()
+                    pre_v_all.setdefault(idx, []).append(output.detach())
                 return hook
 
             handles.append(attn.k_proj.register_forward_hook(make_k_hook(layer_idx)))
             handles.append(attn.v_proj.register_forward_hook(make_v_hook(layer_idx)))
         return handles
+
+    @staticmethod
+    def _select_prefill_capture(
+        captures_all: dict[int, list[torch.Tensor]],
+        sink_ctx: int,
+        proj_name: str,
+    ) -> dict[int, torch.Tensor]:
+        """Pick the prefill capture per layer by matching `shape[1] == sink_ctx`.
+
+        Among captures per layer, the prefill is the one whose K spans the
+        full [sink, sink+ctx_len) region. KVzip's scoring task uses a
+        different (typically shorter) sequence, so its captures have a
+        different shape[1] and are filtered out here.
+
+        If multiple captures match (rare — would mean the model was
+        re-prefilled), we take the FIRST: prefill chronologically precedes
+        scoring, and `setdefault.append` preserves call order.
+        """
+        out: dict[int, torch.Tensor] = {}
+        for layer_idx, caps in captures_all.items():
+            matches = [t for t in caps if t.shape[1] == sink_ctx]
+            if not matches:
+                shapes = [tuple(t.shape) for t in caps]
+                raise RuntimeError(
+                    f"No {proj_name} capture at layer {layer_idx} with "
+                    f"shape[1]={sink_ctx} (sink+ctx_len). Captured shapes: "
+                    f"{shapes}. The hook plumbing or KVzip's prefill flow "
+                    f"changed; can no longer locate the prefill forward."
+                )
+            out[layer_idx] = matches[0]
+        return out
 
     def _build_chunk(
         self,
