@@ -1,0 +1,3 @@
+[submodule "src/external/cacheblend-hf-v7"]
+	path = src/external/cacheblend-hf-v7
+	url = https://github.com/chjs/cacheblend-hf-v7.git

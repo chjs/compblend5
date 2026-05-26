@@ -1,0 +1,43 @@
+# Python bytecode / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+*.egg
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# HuggingFace caches — never commit (large)
+*.bin
+*.safetensors
+*.pt
+*.pth
+hf_cache/
+transformers_cache/
+.hf_home/
+
+# Logs
+logs/
+*.log

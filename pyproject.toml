@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "compblend"
+version = "0.5.0.dev0"
+description = "Compressed KV cache blending — cacheblend-hf-v7 core + KVzip/SnapKV/PyramidKV/H2O/KIVI backends with Gated HKVD."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "ch.jungsik" }]
+dependencies = [
+    # Unpinned at the project level. Use cacheblend-hf-v7's pinned stack on GPU pods.
+    "torch>=2.1",
+    "transformers>=4.40",
+    # cacheblend (the v7 CacheBlend core) is installed separately from the
+    # submodule at src/external/cacheblend-hf-v7. See README for install order.
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["compblend*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+pythonpath = ["src"]
+markers = [
+    "gpu: requires GPU + real model (skipped by default in CI)",
+    "slow: takes >30s",
+]
