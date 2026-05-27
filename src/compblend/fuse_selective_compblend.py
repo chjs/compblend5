@@ -73,17 +73,34 @@ def _select_recompute_indices(
     config: CompBlendConfig,
     structural_mask: torch.Tensor,
     forced_mask: torch.Tensor,
+    eligible_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Dispatch on `config.selector`. Returns sorted-ascending int64 indices."""
+    """Dispatch on `config.selector`. Returns sorted-ascending int64 indices.
+
+    `eligible_mask` is the compression-aware "candidate pool" — typically the
+    union over heads of `valid_mask` at the check layer (= positions that any
+    head retained). It is applied ONLY to selectors that should respect
+    compression's intent:
+      - `hkvd_only`        : ignores eligible_mask (v7/LMCache baseline —
+                              free to pick evicted positions, by design).
+      - `importance_only`  : naturally avoids evicted (importance=0 there);
+                              eligible_mask still applied for explicitness.
+      - `gated_top_k`      : restricts candidates to eligible_mask.
+                              Paper §3 alignment: "trust compression".
+    """
     structural_eff = structural_mask if config.exempt_structural else None
 
     if config.selector == "hkvd_only":
-        # Honor forced and structural without using gated_top_k's gate.
+        # naive HKVD — does NOT honor eligible_mask (by design).
+        # Picks top-k by deviation regardless of compression state. At
+        # heavy compression this tends to pick evicted positions (large
+        # ‖K_fresh − 0‖²). Functionally that "recovers" them via sparse
+        # forward, but it violates the paper's principle of trusting
+        # compression. Kept as a baseline for comparison.
         dev = deviations.clone()
         if forced_mask is not None and bool(forced_mask.any().item()):
             dev[forced_mask] = float("inf")
         if structural_eff is not None and bool(structural_eff.any().item()):
-            # Structural is exempt: never picked.
             dev[structural_eff] = float("-inf")
         target_k = max(
             recompute_k,
@@ -97,6 +114,17 @@ def _select_recompute_indices(
             scores[forced_mask] = float("inf")
         if structural_eff is not None and bool(structural_eff.any().item()):
             scores[structural_eff] = float("-inf")
+        # Explicit eligibility (importance=0 at evicted naturally, but
+        # explicit guard prevents picking those when ties occur).
+        if eligible_mask is not None:
+            not_eligible = (~eligible_mask) & (
+                forced_mask.logical_not()
+                if forced_mask is not None
+                else torch.ones_like(eligible_mask)
+            )
+            scores = torch.where(
+                not_eligible, torch.full_like(scores, float("-inf")), scores,
+            )
         target_k = max(
             recompute_k,
             int(forced_mask.sum().item()) if forced_mask is not None else 0,
@@ -111,6 +139,7 @@ def _select_recompute_indices(
             gate_percentile=config.gate_percentile,
             structural_mask=structural_eff,
             forced_mask=forced_mask,
+            eligible_mask=eligible_mask,
         )
 
     raise ValueError(f"unknown selector: {config.selector!r}")
@@ -350,6 +379,10 @@ def fuse_selective_compblend(
     # is irrelevant to selector input.
     importance_full = torch.zeros(total_seq, dtype=torch.float32, device=device)
     structural_full = torch.zeros(total_seq, dtype=torch.bool, device=device)
+    # Eligibility for the gated path: union over heads at the check layer
+    # ("kept by any head"). Sys/query chunks (no valid_mask) default True
+    # because they were never compressed.
+    eligible_full = torch.ones(total_seq, dtype=torch.bool, device=device)
 
     for chunk, (start, end) in zip(chunks, offsets):
         if not kv_store.has(chunk.chunk_id):
@@ -376,6 +409,10 @@ def fuse_selective_compblend(
             chunk_imp_1d = chunk_internal_rank(chunk_imp_1d)
         importance_full[start:end] = chunk_imp_1d
         structural_full[start:end] = chunk_struct
+        # Eligible at check layer = union over heads of valid_mask. If the
+        # chunk has no valid_mask key (sys/query precompute), `_load_chunk_
+        # extensions` set it all-True → union is all-True too.
+        eligible_full[start:end] = chunk_valid[config.check_layer].any(dim=0)
 
     # ── Forward setup ──────────────────────────────────────────────────
     input_ids = fused_input_ids(chunks, device=device)
@@ -447,6 +484,7 @@ def fuse_selective_compblend(
             config=config,
             structural_mask=structural_full,
             forced_mask=forced_mask,
+            eligible_mask=eligible_full,
         )
         topk_num = int(top_indices.shape[0])
         if topk_num == 0:

@@ -167,6 +167,62 @@ def test_gated_top_k_does_not_overflow_with_large_forced_pool():
     assert sorted(extras) == [16, 17, 18]
 
 
+def test_gated_top_k_eligible_mask_restricts_to_kept():
+    """eligible_mask=False positions must NEVER appear in the result (unless forced)."""
+    n = 10
+    # Make positions 0..4 ineligible (= evicted), 5..9 eligible (= kept)
+    eligible = torch.tensor([False]*5 + [True]*5, dtype=torch.bool)
+    # Importance / HKVD that, without eligibility, would prefer ineligible positions.
+    importance = torch.tensor([10., 9., 8., 7., 6., 5., 4., 3., 2., 1.])
+    hkvd = torch.tensor([10., 9., 8., 7., 6., 5., 4., 3., 2., 1.])
+    idx = gated_top_k(
+        hkvd_scores=hkvd, importance_scores=importance,
+        recompute_k=3, gate_percentile=0.5,
+        eligible_mask=eligible,
+    )
+    chosen = idx.tolist()
+    # Without eligible_mask, top-3 by importance would be {0,1,2}.
+    # With eligible_mask, candidates = {5..9}; gate top-50% = {5,6,7} by imp;
+    # HKVD top-3 within = {5,6,7}.
+    assert all(c >= 5 for c in chosen), (
+        f"eligible_mask was bypassed; got {chosen} (expected all >= 5)"
+    )
+
+
+def test_gated_top_k_forced_overrides_eligible():
+    """forced positions are included regardless of eligibility (last_pos for decode)."""
+    n = 8
+    eligible = torch.tensor([True]*6 + [False]*2, dtype=torch.bool)
+    forced = torch.zeros(n, dtype=torch.bool)
+    forced[7] = True  # last position, but ineligible — must still be picked
+    idx = gated_top_k(
+        hkvd_scores=torch.zeros(n),
+        importance_scores=torch.zeros(n),
+        recompute_k=1, gate_percentile=0.5,
+        eligible_mask=eligible, forced_mask=forced,
+    )
+    assert 7 in idx.tolist(), (
+        "forced position not picked despite being ineligible"
+    )
+
+
+def test_gated_top_k_eligible_default_none_unchanged():
+    """eligible_mask=None preserves the pre-2026-05-27 behavior."""
+    n = 6
+    importance = torch.tensor([1., 2., 3., 4., 5., 6.])
+    hkvd = torch.tensor([6., 5., 4., 3., 2., 1.])
+    idx_with_none = gated_top_k(
+        hkvd_scores=hkvd, importance_scores=importance,
+        recompute_k=2, gate_percentile=0.5,
+    )
+    idx_with_all_true = gated_top_k(
+        hkvd_scores=hkvd, importance_scores=importance,
+        recompute_k=2, gate_percentile=0.5,
+        eligible_mask=torch.ones(n, dtype=torch.bool),
+    )
+    assert idx_with_none.tolist() == idx_with_all_true.tolist()
+
+
 def test_gated_top_k_rejects_mismatched_lengths():
     with pytest.raises(ValueError):
         gated_top_k(

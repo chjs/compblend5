@@ -82,35 +82,41 @@ def gated_top_k(
     gate_percentile: float,
     structural_mask: torch.Tensor | None = None,
     forced_mask: torch.Tensor | None = None,
+    eligible_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Paper §3 Gated HKVD: importance gates the candidate set, HKVD picks within it.
 
     Algorithm:
       1. Include all `forced_mask` positions unconditionally.
       2. Exclude all `structural_mask` positions.
-      3. From the remaining positions, keep those with importance in the top
-         `(1 - gate_percentile)` fraction. With `gate_percentile=0.5`, keeps
+      3. Restrict the candidate pool to `eligible_mask` (None = all).
+      4. From the remaining positions, keep those with importance in the top
+         `gate_percentile` fraction. With `gate_percentile=0.5`, keeps
          the top 50% by importance.
-      4. From the gated set, pick `recompute_k - forced_count` by HKVD.
+      5. From the gated set, pick `recompute_k - forced_count` by HKVD.
 
-    Tied importance values at the gate threshold pass (`>=`), so slightly
-    more than `gate_percentile * N` may pass — acceptable.
+    Why `eligible_mask` (added 2026-05-27): compression's design intent is
+    "evict the unimportant tokens; trust the choice". Recomputation must
+    NOT recover evicted tokens — they were deliberately discarded. Pass
+    `eligible_mask = (any-head retained at this position)` to restrict the
+    selector to the kept set. forced_mask (e.g. last_pos for decode)
+    overrides eligibility — those positions are included regardless.
 
     Args:
         hkvd_scores:        [N] per-token deviation.
         importance_scores:  [N] per-token compression importance.
         recompute_k:        target number of tokens to select.
         gate_percentile:    fraction of non-forced tokens to keep as gated
-                            candidates. 1.0 = skip gate (HKVD-only over
-                            non-forced, non-structural). 0.0 = also skip
-                            (no gating). Typical: 0.5.
+                            candidates. 1.0 = skip gate. Typical: 0.5.
         structural_mask:    optional [N] bool. True = exempt (never selected).
-        forced_mask:        optional [N] bool. True = always selected (e.g.
-                            gap positions with no cached K/V).
+        forced_mask:        optional [N] bool. True = always selected.
+        eligible_mask:      optional [N] bool. True = position is in the
+                            candidate pool. None = all positions eligible
+                            (backward compat). Compression-aware callers
+                            pass `union-of-heads valid_mask` here.
 
     Returns:
-        [k_eff] int64 of selected positions, sorted ascending. `k_eff` ==
-        `max(recompute_k, forced_count)` clipped to N − structural_count.
+        int64 tensor of selected positions, sorted ascending.
     """
     n = int(hkvd_scores.numel())
     if int(importance_scores.numel()) != n:
@@ -134,6 +140,13 @@ def gated_top_k(
             raise ValueError("forced_mask length mismatch")
         forced = forced_mask.to(device=device, dtype=torch.bool)
 
+    if eligible_mask is None:
+        eligible = torch.ones(n, dtype=torch.bool, device=device)
+    else:
+        if int(eligible_mask.numel()) != n:
+            raise ValueError("eligible_mask length mismatch")
+        eligible = eligible_mask.to(device=device, dtype=torch.bool)
+
     # Resolve conflicts: forced wins over structural (a gap that's also
     # window-protected still MUST recompute — no cached K to attend to).
     structural = structural & ~forced
@@ -151,8 +164,11 @@ def gated_top_k(
         out, _ = torch.sort(forced_idx)
         return out
 
-    # Build the cached-candidate pool: not-forced AND not-structural.
-    cand = (~forced) & (~structural)
+    # Build the candidate pool: not-forced AND not-structural AND eligible.
+    # `eligible` enforces "compression's choice is respected" — evicted
+    # positions are not selectable by the gated path. forced positions are
+    # included regardless (they override eligibility).
+    cand = (~forced) & (~structural) & eligible
     if not bool(cand.any().item()):
         # Nothing to add beyond forced.
         out, _ = torch.sort(forced_idx)
