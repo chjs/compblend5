@@ -50,10 +50,12 @@ ATTN_IMPL = os.environ.get("CACHEBLEND_ATTN_IMPL", "sdpa")
 RECOMP_RATIO = float(os.environ.get("COMPBLEND_RECOMP_RATIO", "0.15"))
 CHECK_LAYER = int(os.environ.get("COMPBLEND_CHECK_LAYER", "1"))
 N_MAX = int(os.environ.get("COMPBLEND_N", "30"))
-LOONG_DATA_DIR = Path(os.environ.get("MODELSCOPE_LOONG_CACHE", "/root/loong_data"))
+LOONG_DATA_DIR = Path(os.environ.get("MODELSCOPE_LOONG_CACHE", "/root/loong_data/doc"))
 LOONG_JSONL = Path(os.environ.get(
     "LOONG_JSONL", "/root/Loong/data/loong.jsonl",
 ))
+LOONG_LEVELS = [int(x) for x in os.environ.get("LOONG_LEVELS", "1,2").split(",")]
+LOONG_SETS = [int(x) for x in os.environ.get("LOONG_SETS", "2").split(",")]
 OUT_PATH = Path(os.environ.get("COMPBLEND_OUT", str(_REPO / "logs" / "loong_set1_sweep.json")))
 MAX_NEW_TOKENS = 64    # Loong answers can be slightly longer than MuSiQue's
 
@@ -151,22 +153,29 @@ def _load_doc_content(item: dict, doc_name: str, idx: int, doc_path: Path) -> st
 
 
 def _load_loong_questions(
-    jsonl_path: Path, doc_path: Path, level: int, set_id: int, language: str,
+    jsonl_path: Path, doc_path: Path,
+    levels: list[int], set_ids: list[int], language: str,
     max_n: int,
 ) -> list[dict]:
-    """Filter Loong jsonl + materialize doc texts. Skip rows with missing files."""
+    """Filter Loong jsonl + materialize doc texts. Skip rows with missing files.
+
+    Accepts lists of levels and set ids so we can pool e.g. level=1+2, set=2
+    when individual cells are too small for statistical comparison.
+    Only str-typed answers are included (substring F1 won't work for dict/list).
+    """
     rows = []
     with open(jsonl_path) as f:
         for line in f:
             line = line.strip()
             if not line: continue
             d = json.loads(line)
-            if d["level"] != level: continue
-            if d["set"] != set_id: continue
+            if d["level"] not in levels: continue
+            if d["set"] not in set_ids: continue
             if d["language"] != language: continue
+            if not isinstance(d["answer"], str): continue
             rows.append(d)
     print(f"[loong] filtered to {len(rows)} rows "
-          f"(level={level}, set={set_id}, lang={language})", flush=True)
+          f"(levels={levels}, sets={set_ids}, lang={language}, answer=str)", flush=True)
 
     materialized = []
     skipped_count = 0
@@ -324,7 +333,7 @@ def main() -> int:
     # Load Loong subset
     eval_dataset = _load_loong_questions(
         LOONG_JSONL, LOONG_DATA_DIR,
-        level=1, set_id=1, language="en", max_n=N_MAX,
+        levels=LOONG_LEVELS, set_ids=LOONG_SETS, language="en", max_n=N_MAX,
     )
     if len(eval_dataset) == 0:
         print("FATAL: no Loong questions loaded. Check LOONG_JSONL and MODELSCOPE_LOONG_CACHE.")
@@ -435,7 +444,7 @@ def main() -> int:
             "recomp_ratio": RECOMP_RATIO, "check_layer": CHECK_LAYER,
             "n": len(eval_dataset),
             "sweep_ratios": SWEEP_RATIOS, "sweep_gates": SWEEP_GATES,
-            "dataset": "Loong level=1 set=1 lang=en (Spotlight Locating, 10K-50K ctx)",
+            "dataset": f"Loong levels={LOONG_LEVELS} sets={LOONG_SETS} lang=en (str answers only)",
             "kvzip_level": "pair",
             "valid_mask_source": "_derive_valid_mask_pair (verbatim from KVzip._threshold)",
             "metric": "token-F1 (substring) — NOT Loong's official LLM-judge",
