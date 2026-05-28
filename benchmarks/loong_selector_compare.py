@@ -175,13 +175,19 @@ def main() -> int:
             # Reference: full prefill F1
             out = fuse_full_recompute(lw, chunks, return_layerwise_output=True)
             text_full = _greedy_decode(lw.model, tokenizer, out.logits, out.past_key_values, device)
-            f1_full, em_full = max(
-                (_compute_f1(text_full, a, tokenizer) for a in ex["answers"]),
-                key=lambda x: x[0],
-            ) if "answers" in ex else (
-                (_compute_f1(text_full, ex["answer"], tokenizer)
-                 if isinstance(ex["answer"], str) else (0.0, 0)),
-            )
+
+            def _max_f1(text):
+                if "answers" in ex:
+                    return max(
+                        (_compute_f1(text, a, tokenizer) for a in ex["answers"]),
+                        key=lambda x: x[0],
+                    )
+                ans = ex.get("answer")
+                if isinstance(ans, str):
+                    return _compute_f1(text, ans, tokenizer)
+                return (0.0, 0)
+
+            f1_full, em_full = _max_f1(text_full)
             del out
             if device.type == "cuda": torch.cuda.empty_cache()
 
@@ -237,12 +243,7 @@ def main() -> int:
                         flags=flags, selector_stats=sel_stats,
                     )
                     text = _greedy_decode(lw.model, tokenizer, out.logits, out.past_key_values, device)
-                    if "answers" in ex:
-                        f1, em = max((_compute_f1(text, a, tokenizer) for a in ex["answers"]),
-                                     key=lambda x: x[0])
-                    else:
-                        f1, em = (_compute_f1(text, ex["answer"], tokenizer)
-                                  if isinstance(ex["answer"], str) else (0.0, 0))
+                    f1, em = _max_f1(text)
                     elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
                     rec = {
