@@ -244,32 +244,39 @@ def _build_chunks(
         chunks[N+1]    : structural suffix  = instruction + question + assistant_open
                                               (uncompressed)
 
-    Returns (chunks, structural_idx, compressible_idx). The benchmark loop
-    must compress chunks at `compressible_idx` and precompute the rest.
+    Returns (chunks, structural_idx, compressible_idx).
 
-    Each chunk is tokenized independently (add_special_tokens=False); BOS is
-    prepended once to chunks[0] via tokenizer.bos_token_id. The caller MUST
-    verify invariant I1 (concat == full tokenization) after building.
+    Tokenization (CRITICAL for invariant I1):
+      Tokenize the FULL concatenation once and slice at segment boundaries
+      computed via cumulative-prefix retokenization. This guarantees by
+      construction that concat(c.token_ids) == tokenize(full_prompt), even
+      when BPE merges occur at chunk boundaries (e.g. "\\n\\n"+"\\n\\n" → one
+      "\\n\\n\\n\\n" token). Per-chunk independent tokenization is broken at
+      such boundaries.
     """
     from cacheblend.chunker import Chunk, _stable_id
 
     bos = tokenizer.bos_token_id
-    chunks = []
-
-    # Structural prefix: BOS + chat user_open
-    pref_ids = tokenizer(user_open, add_special_tokens=False)["input_ids"]
+    segments = [user_open] + list(doc_contents) + [query_suffix]
+    full_text = "".join(segments)
+    full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
     if bos is not None:
-        pref_ids = [bos] + pref_ids
-    chunks.append(Chunk(text=user_open, token_ids=pref_ids, chunk_id=_stable_id(user_open, pref_ids)))
+        full_ids = [bos] + full_ids
+    bos_offset = 1 if bos is not None else 0
 
-    # Doc chunks (compressible)
-    for d_text in doc_contents:
-        d_ids = tokenizer(d_text, add_special_tokens=False)["input_ids"]
-        chunks.append(Chunk(text=d_text, token_ids=d_ids, chunk_id=_stable_id(d_text, d_ids)))
+    boundaries = [bos_offset]
+    cumulative = ""
+    for seg in segments:
+        cumulative += seg
+        n_tokens = len(tokenizer(cumulative, add_special_tokens=False)["input_ids"])
+        boundaries.append(bos_offset + n_tokens)
 
-    # Structural suffix: instruction + question + assistant_open
-    suf_ids = tokenizer(query_suffix, add_special_tokens=False)["input_ids"]
-    chunks.append(Chunk(text=query_suffix, token_ids=suf_ids, chunk_id=_stable_id(query_suffix, suf_ids)))
+    chunks = []
+    for i, seg in enumerate(segments):
+        s = 0 if i == 0 else boundaries[i]
+        e = boundaries[i + 1]
+        ids = full_ids[s:e]
+        chunks.append(Chunk(text=seg, token_ids=ids, chunk_id=_stable_id(seg, ids)))
 
     structural_idx = [0, len(chunks) - 1]
     compressible_idx = list(range(1, len(chunks) - 1))
