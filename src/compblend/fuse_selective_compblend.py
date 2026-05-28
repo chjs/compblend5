@@ -354,6 +354,7 @@ def fuse_selective_compblend(
     return_layerwise_output: bool = False,
     return_hkvd_indices: bool = False,
     timings: dict | None = None,
+    last_logits_only: bool = False,
 ):
     """Paper §4 selective recompute + paper §3 Gated HKVD + per-head mask.
 
@@ -701,14 +702,19 @@ def fuse_selective_compblend(
 
         # ── Final norm + lm_head on SPARSE hidden ──────────────────────
         h_sparse_normed = inner.norm(h_sparse)
-        logits_sparse = layerwise_model.model.lm_head(h_sparse_normed)        # (1, Q, vocab)
+        if last_logits_only:
+            # top_indices is sorted ASC and total_seq-1 is forced via forced_mask,
+            # so the last sparse row corresponds to the last sequence position.
+            logits_full = layerwise_model.model.lm_head(h_sparse_normed[:, -1:, :])
+        else:
+            logits_sparse = layerwise_model.model.lm_head(h_sparse_normed)        # (1, Q, vocab)
 
-        vocab_size = logits_sparse.shape[-1]
-        logits_full = torch.zeros(
-            (1, total_seq, vocab_size),
-            dtype=logits_sparse.dtype, device=device,
-        )
-        logits_full[:, top_indices, :] = logits_sparse
+            vocab_size = logits_sparse.shape[-1]
+            logits_full = torch.zeros(
+                (1, total_seq, vocab_size),
+                dtype=logits_sparse.dtype, device=device,
+            )
+            logits_full[:, top_indices, :] = logits_sparse
         timer.mark("lmhead")
 
     # Stash timing events on the caller's dict (if provided)

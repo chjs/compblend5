@@ -214,7 +214,9 @@ def main() -> int:
         fuse_selective_compblend(
             lw, chunks, kv_nozip, cb_cfg,
             return_layerwise_output=True, timings=timings_cb,
+            last_logits_only=True,
         )
+        if device.type == "cuda": torch.cuda.empty_cache()
 
         # CompBlend with KVzip — compress each doc, build new kv_store
         doc_slice = slice(0, len(ex["doc_contents"]))
@@ -240,7 +242,9 @@ def main() -> int:
         fuse_selective_compblend(
             lw, chunks, kv_zip, compblend_cfg,
             return_layerwise_output=True, timings=timings_compblend,
+            last_logits_only=True,
         )
+        if device.type == "cuda": torch.cuda.empty_cache()
 
         sample = {
             "id": ex["id"], "context_tokens": int(ex.get("length", -1)),

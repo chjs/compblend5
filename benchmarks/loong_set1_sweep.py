@@ -372,6 +372,8 @@ def main() -> int:
         res, _ = _greedy_decode(lw.model, tokenizer, out.logits, out.past_key_values, device, t0)
         f1_full_q = _compute_f1(res, ex["answer"], tokenizer) if isinstance(ex["answer"], str) else 0.0
         f1_full.append(f1_full_q)
+        del out
+        if device.type == "cuda": torch.cuda.empty_cache()
 
         # Compress doc chunks once at ratio=1.0
         compressed_1p0 = {}
@@ -400,11 +402,16 @@ def main() -> int:
             )
             if device.type == "cuda": torch.cuda.synchronize()
             t0 = time.perf_counter()
-            out = fuse_selective_compblend(lw, chunks, kv_r, cb_cfg, return_layerwise_output=True)
+            out = fuse_selective_compblend(
+                lw, chunks, kv_r, cb_cfg,
+                return_layerwise_output=True, last_logits_only=True,
+            )
             res, _ = _greedy_decode(lw.model, tokenizer, out.logits, out.past_key_values, device, t0)
             f1_h = _compute_f1(res, ex["answer"], tokenizer) if isinstance(ex["answer"], str) else 0.0
             f1_arms[(r, "hkvd_only")].append(f1_h)
             per_q_summary[f"r{r}_h"] = f1_h
+            del out
+            if device.type == "cuda": torch.cuda.empty_cache()
 
             for g in SWEEP_GATES:
                 cb_cfg = CompBlendConfig(
@@ -414,11 +421,16 @@ def main() -> int:
                 )
                 if device.type == "cuda": torch.cuda.synchronize()
                 t0 = time.perf_counter()
-                out = fuse_selective_compblend(lw, chunks, kv_r, cb_cfg, return_layerwise_output=True)
+                out = fuse_selective_compblend(
+                    lw, chunks, kv_r, cb_cfg,
+                    return_layerwise_output=True, last_logits_only=True,
+                )
                 res, _ = _greedy_decode(lw.model, tokenizer, out.logits, out.past_key_values, device, t0)
                 f1 = _compute_f1(res, ex["answer"], tokenizer) if isinstance(ex["answer"], str) else 0.0
                 f1_arms[(r, f"gate={g}")].append(f1)
                 per_q_summary[f"r{r}_g{g}"] = f1
+                del out
+                if device.type == "cuda": torch.cuda.empty_cache()
 
         print(
             f"[{idx + 1}/{len(eval_dataset)}] type={ex['type'][:3]} ctx_len={ex.get('length',-1):>6}  "
