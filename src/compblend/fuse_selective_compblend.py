@@ -725,6 +725,24 @@ def fuse_selective_compblend(
             n_selected = int(is_top_cpu.sum().item())
             # Overlap with structural (selected positions that are structural)
             n_sel_from_struct = int((is_top_cpu & structural_mask_cpu).sum().item())
+            # Selection diagnostics — how does this selector distribute its
+            # choices across eligible / ineligible positions, and how do its
+            # picked HKVD / importance values compare to the unpicked rest?
+            sel_eligible_count = int((is_top_cpu & eligible_mask_cpu).sum().item())
+            sel_ineligible_count = n_selected - sel_eligible_count
+            # HKVD / importance distributions at selected vs not-selected
+            sel_dev = deviations[top_indices].float()
+            not_top = ~is_top
+            not_top[forced_mask] = False  # exclude forced (selected anyway)
+            unsel_dev = deviations[not_top].float() if bool(not_top.any().item()) else None
+            sel_imp = importance_full[top_indices].float()
+            # By eligibility — HKVD/importance at eligible vs ineligible
+            elig = eligible_full
+            inelig = ~eligible_full
+            elig_dev_mean = float(deviations[elig].float().mean().item()) if bool(elig.any().item()) else None
+            inelig_dev_mean = float(deviations[inelig].float().mean().item()) if bool(inelig.any().item()) else None
+            elig_imp_mean = float(importance_full[elig].float().mean().item()) if bool(elig.any().item()) else None
+            inelig_imp_mean = float(importance_full[inelig].float().mean().item()) if bool(inelig.any().item()) else None
             selector_stats.update({
                 "total_tokens": n_total,
                 "structural_tokens": n_struct,
@@ -735,6 +753,8 @@ def fuse_selective_compblend(
                 "selected_recompute_tokens": n_selected,
                 "selected_from_structural_tokens": n_sel_from_struct,
                 "selected_from_compressible_tokens": n_selected - n_sel_from_struct,
+                "selected_from_eligible_tokens": sel_eligible_count,
+                "selected_from_ineligible_tokens": sel_ineligible_count,
                 "recompute_ratio_requested": float(config.recompute_ratio),
                 "selected_ratio_actual": (n_selected / n_total) if n_total else 0.0,
                 "eligible_ratio": (n_eligible / n_total) if n_total else 0.0,
@@ -748,6 +768,21 @@ def fuse_selective_compblend(
                     config.selector == "gated_top_k"
                     and 0.0 < float(config.gate_percentile) < 1.0
                 ),
+                # Distribution diagnostics
+                "selected_hkvd_mean": float(sel_dev.mean().item()),
+                "selected_hkvd_std":  float(sel_dev.std().item()) if sel_dev.numel() > 1 else 0.0,
+                "selected_hkvd_min":  float(sel_dev.min().item()),
+                "selected_hkvd_max":  float(sel_dev.max().item()),
+                "not_selected_hkvd_mean": float(unsel_dev.mean().item()) if unsel_dev is not None else None,
+                "selected_importance_mean": float(sel_imp.mean().item()),
+                "selected_importance_std":  float(sel_imp.std().item()) if sel_imp.numel() > 1 else 0.0,
+                "eligible_hkvd_mean":   elig_dev_mean,
+                "ineligible_hkvd_mean": inelig_dev_mean,
+                "eligible_importance_mean":   elig_imp_mean,
+                "ineligible_importance_mean": inelig_imp_mean,
+                # Selected indices themselves (for cross-selector overlap analysis).
+                # ~4-5K ints per call → ~30KB JSON. Manageable.
+                "selected_indices": top_indices.detach().cpu().tolist(),
             })
 
         # Mixed K_pre, V: cached at non-top, fresh at top.
