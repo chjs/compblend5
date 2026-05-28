@@ -185,14 +185,16 @@ class KVzipBackend(CompressionBackendBase):
         handles = self._install_hooks(mk, pre_rope_k_all, pre_v_all)
 
         try:
-            # KVzip's `prefill(ctx_ids: Union[str, torch.Tensor])` accepts a
-            # tensor directly — avoid the decode→encode roundtrip that broke
-            # for tokenizer-unstable Loong docs.
-            ids = input_ids
-            if ids.dim() == 1:
-                ids = ids.unsqueeze(0)
-            ids = ids.to(mk.model.device)
-            kv = mk.prefill(ids, load_score=False, do_score=True)
+            # KVzip accepts both tensor and text — but its internal chunked
+            # scoring task has a buggy length-accounting at very large ctx
+            # (>~20K). Empirically: passing tensor directly fails the
+            # `kv.score[0].shape[-1] == kv.ctx_len` assertion at long context;
+            # going through decode→encode happens to bring the token count
+            # within scoring's tolerance because tokenizer.decode→encode of
+            # Llama is roughly idempotent for clean text (and where it isn't,
+            # the bench's I2 invariant catches it). Use text path.
+            text = self._ids_to_text(mk, input_ids)
+            kv = mk.prefill(text, load_score=False, do_score=True)
         finally:
             for h in handles:
                 h.remove()
