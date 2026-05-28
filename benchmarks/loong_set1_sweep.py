@@ -321,24 +321,18 @@ def _derive_valid_mask_pair(importance: torch.Tensor, target_ratio: float) -> to
 
 
 def _make_entry_at_ratio(cmp_full, target_ratio, n_kv_heads, head_dim):
-    """Derive valid_mask at target_ratio + zero-fill K/V at evicted slots."""
-    # Storage length (from the tensor itself) is the source of truth — KVzip's
-    # tokenizer can produce a ctx_len that differs from len(token_ids) by a
-    # special-token offset, and importance/valid_mask are sized to storage.
-    storage_len = cmp_full.key_cache[0].shape[1]
-    n_layers = cmp_full.num_layers
+    """Keep K, V, importance INTACT — only valid_mask reflects eviction.
+
+    Fix for F1 catastrophe: zero-filling K_stored corrupts HKVD score and
+    cached K in sparse layers. CompBlend-old does it this way (cache.py).
+    """
+    del n_kv_heads, head_dim
     new_valid = _derive_valid_mask_pair(cmp_full.importance, target_ratio)
-    new_K, new_V = [], []
-    for li in range(n_layers):
-        k = cmp_full.key_cache[li].view(1, storage_len, n_kv_heads, head_dim)
-        v = cmp_full.value_cache[li].view(1, storage_len, n_kv_heads, head_dim)
-        m = new_valid[li].t().unsqueeze(0).unsqueeze(-1).to(k.dtype)
-        new_K.append((k * m).reshape(1, storage_len, n_kv_heads * head_dim).contiguous())
-        new_V.append((v * m).reshape(1, storage_len, n_kv_heads * head_dim).contiguous())
-    new_imp = cmp_full.importance * new_valid.to(cmp_full.importance.dtype)
     return {
-        "K": new_K, "V": new_V,
-        "valid_mask": new_valid, "importance": new_imp,
+        "K": list(cmp_full.key_cache),
+        "V": list(cmp_full.value_cache),
+        "valid_mask": new_valid,
+        "importance": cmp_full.importance,
         "is_structural": cmp_full.is_structural,
         "algo_id": cmp_full.algo_id, "chunk_id": cmp_full.chunk_id,
     }

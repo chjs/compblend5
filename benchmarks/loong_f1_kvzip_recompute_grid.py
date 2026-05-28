@@ -328,20 +328,20 @@ def _derive_valid_mask_pair(importance: torch.Tensor, target_ratio: float) -> to
 
 
 def _make_entry_at_ratio(cmp_full, target_ratio: float, n_kv_heads: int, head_dim: int) -> dict:
-    storage_len = cmp_full.key_cache[0].shape[1]
-    n_layers = cmp_full.num_layers
+    """Keep K, V, importance INTACT — only valid_mask reflects eviction.
+
+    Fix for the F1 catastrophe at kvzip<1.0: zero-filling K_stored at evicted
+    slots corrupted (a) the HKVD score (= ‖K_fresh - 0‖² = ‖K_fresh‖² → huge)
+    and (b) the cached K used in sparse layers. CompBlend-old's BlendingCache
+    works this way too (cache.py:overlay_chunk).
+    """
+    del n_kv_heads, head_dim
     new_valid = _derive_valid_mask_pair(cmp_full.importance, target_ratio)
-    new_K, new_V = [], []
-    for li in range(n_layers):
-        k = cmp_full.key_cache[li].view(1, storage_len, n_kv_heads, head_dim)
-        v = cmp_full.value_cache[li].view(1, storage_len, n_kv_heads, head_dim)
-        m = new_valid[li].t().unsqueeze(0).unsqueeze(-1).to(k.dtype)
-        new_K.append((k * m).reshape(1, storage_len, n_kv_heads * head_dim).contiguous())
-        new_V.append((v * m).reshape(1, storage_len, n_kv_heads * head_dim).contiguous())
-    new_imp = cmp_full.importance * new_valid.to(cmp_full.importance.dtype)
     return {
-        "K": new_K, "V": new_V,
-        "valid_mask": new_valid, "importance": new_imp,
+        "K": list(cmp_full.key_cache),
+        "V": list(cmp_full.value_cache),
+        "valid_mask": new_valid,
+        "importance": cmp_full.importance,
         "is_structural": cmp_full.is_structural,
         "algo_id": cmp_full.algo_id, "chunk_id": cmp_full.chunk_id,
     }
