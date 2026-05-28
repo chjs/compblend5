@@ -277,16 +277,19 @@ def _derive_valid_mask_pair(importance: torch.Tensor, target_ratio: float) -> to
 
 def _make_entry_at_ratio(cmp_full, target_ratio, n_kv_heads, head_dim):
     """Derive valid_mask at target_ratio + zero-fill K/V at evicted slots."""
-    chunk_len = cmp_full.chunk_len
+    # Storage length (from the tensor itself) is the source of truth — KVzip's
+    # tokenizer can produce a ctx_len that differs from len(token_ids) by a
+    # special-token offset, and importance/valid_mask are sized to storage.
+    storage_len = cmp_full.key_cache[0].shape[1]
     n_layers = cmp_full.num_layers
     new_valid = _derive_valid_mask_pair(cmp_full.importance, target_ratio)
     new_K, new_V = [], []
     for li in range(n_layers):
-        k = cmp_full.key_cache[li].view(1, chunk_len, n_kv_heads, head_dim)
-        v = cmp_full.value_cache[li].view(1, chunk_len, n_kv_heads, head_dim)
+        k = cmp_full.key_cache[li].view(1, storage_len, n_kv_heads, head_dim)
+        v = cmp_full.value_cache[li].view(1, storage_len, n_kv_heads, head_dim)
         m = new_valid[li].t().unsqueeze(0).unsqueeze(-1).to(k.dtype)
-        new_K.append((k * m).reshape(1, chunk_len, n_kv_heads * head_dim).contiguous())
-        new_V.append((v * m).reshape(1, chunk_len, n_kv_heads * head_dim).contiguous())
+        new_K.append((k * m).reshape(1, storage_len, n_kv_heads * head_dim).contiguous())
+        new_V.append((v * m).reshape(1, storage_len, n_kv_heads * head_dim).contiguous())
     new_imp = cmp_full.importance * new_valid.to(cmp_full.importance.dtype)
     return {
         "K": new_K, "V": new_V,
@@ -377,12 +380,29 @@ def main() -> int:
 
         # Compress doc chunks once at ratio=1.0
         compressed_1p0 = {}
+        skip_question = False
         for c in chunks[doc_slice]:
             ids = torch.tensor([c.token_ids], dtype=torch.long, device=device)
             cmp = backend.compress(
                 ids, model=hf_model, budget=CompressionBudget(ratio=1.0),
             )
+            # KVzip decode/encode roundtrip can shift token count by 1+ for some
+            # texts (non-bijective tokenizer). The fuser overlays chunk KV onto
+            # positions [start, start + len(token_ids)] so a length mismatch
+            # corrupts position alignment. Skip the question rather than risk it.
+            if cmp.key_cache[0].shape[1] != len(c.token_ids):
+                print(
+                    f"[skip Q{idx+1}] chunk storage={cmp.key_cache[0].shape[1]} "
+                    f"!= len(token_ids)={len(c.token_ids)} (KVzip tokenizer drift)",
+                    flush=True,
+                )
+                skip_question = True
+                break
             compressed_1p0[c.chunk_id] = cmp
+        if skip_question:
+            del out  # free full_recompute reference
+            if device.type == "cuda": torch.cuda.empty_cache()
+            continue
 
         per_q_summary = {"full": f1_full_q}
         for r in SWEEP_RATIOS:
