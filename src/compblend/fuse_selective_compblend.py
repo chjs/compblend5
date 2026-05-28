@@ -187,6 +187,7 @@ def _build_attn_mask_with_per_head_valid(
     is_top: torch.Tensor,                  # [total_seq] bool — True at top_indices
     n_rep: int,                             # num_heads_q // num_heads_kv
     mask_dtype: torch.dtype,
+    flags: dict | None = None,
 ) -> torch.Tensor:
     """Compose causal mask with per-(KV head, position) validity.
 
@@ -205,6 +206,8 @@ def _build_attn_mask_with_per_head_valid(
     valid_eff = valid_layer | is_top.unsqueeze(0)                     # [H_kv, K]
     if bool(valid_eff.all().item()):
         # No per-head eviction — sparse_causal alone is correct.
+        if flags is not None:
+            flags["per_head_mask_required"] = flags.get("per_head_mask_required", False)
         return sparse_causal
 
     # Memory guard: at long context the full [1, H_q, Q, K] mask exceeds GPU
@@ -227,6 +230,14 @@ def _build_attn_mask_with_per_head_valid(
         # Fallback: causal-only mask. Evicted positions still contribute
         # near-zero (zero-filled K/V × softmax). Print fallback once-per-call
         # so the log shows we're not silently mis-attending.
+        if flags is not None:
+            flags["per_head_mask_required"] = True
+            flags["per_head_mask_fallback_count"] = flags.get(
+                "per_head_mask_fallback_count", 0
+            ) + 1
+            flags["per_head_mask_max_bytes"] = max(
+                flags.get("per_head_mask_max_bytes", 0), mask_bytes
+            )
         import sys as _sys
         print(
             f"[fuser] per-head mask too large "
@@ -236,6 +247,13 @@ def _build_attn_mask_with_per_head_valid(
             file=_sys.stderr, flush=True,
         )
         return sparse_causal
+
+    # Exact per-head mask applied (no fallback).
+    if flags is not None:
+        flags["per_head_mask_required"] = True
+        flags["per_head_mask_exact_count"] = flags.get(
+            "per_head_mask_exact_count", 0
+        ) + 1
 
     # Step 3: additive form. 0 where valid, -inf where evicted.
     # Cast carefully — sparse_causal is in model dtype (fp16/bf16/fp32).
@@ -355,6 +373,7 @@ def fuse_selective_compblend(
     return_hkvd_indices: bool = False,
     timings: dict | None = None,
     last_logits_only: bool = False,
+    flags: dict | None = None,
 ):
     """Paper §4 selective recompute + paper §3 Gated HKVD + per-head mask.
 
@@ -441,6 +460,29 @@ def fuse_selective_compblend(
         torch.zeros((1, total_seq, hidden_kv), dtype=dtype, device=device)
         for _ in range(n_layers)
     ]
+    if flags is not None:
+        bytes_per_elem = (
+            dtype.itemsize if hasattr(dtype, "itemsize") else 2
+        )
+        flags["dense_workspace_bytes"] = (
+            2 * n_layers * total_seq * hidden_kv * bytes_per_elem
+        )
+        flags["dense_workspace_note"] = (
+            "Stage 1 allocates full [1, total_seq, H_kv*D] dense K_stored "
+            "and V_stored per layer; evicted slots are zero-filled but the "
+            "tensor itself is full-length. Stage 2 will replace with sparse "
+            "per-head storage."
+        )
+        flags["total_seq"] = int(total_seq)
+        flags["n_layers"] = int(n_layers)
+        flags["selector"] = config.selector
+        flags["gate_percentile"] = (
+            float(config.gate_percentile)
+            if config.selector == "gated_top_k"
+            else None
+        )
+        flags["recompute_ratio"] = float(config.recompute_ratio)
+        flags["check_layer"] = int(config.check_layer)
     valid_mask_full = torch.zeros(
         n_layers, num_kv_heads, total_seq, dtype=torch.bool, device=device,
     )
@@ -603,6 +645,7 @@ def fuse_selective_compblend(
             is_top=is_top,
             n_rep=n_rep,
             mask_dtype=causal_mask_full.dtype,
+            flags=flags,
         )
 
         # GQA expansion of K/V.
@@ -679,6 +722,7 @@ def fuse_selective_compblend(
                 is_top=is_top,
                 n_rep=n_rep,
                 mask_dtype=causal_mask_full.dtype,
+                flags=flags,
             )
 
             k_rep_li = k_full_li.repeat_interleave(n_rep, dim=1)

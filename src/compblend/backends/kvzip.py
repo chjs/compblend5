@@ -71,17 +71,47 @@ def kvzip_chunk_id(
     ratio: float,
     level: str = "pair",
     prefix: str = "kvzip",
+    *,
+    model_id: str | None = None,
+    tokenizer_id: str | None = None,
+    dtype: str | None = None,
+    n_layers: int | None = None,
+    n_kv_heads: int | None = None,
+    head_dim: int | None = None,
+    algo_version: str = "v1",
 ) -> str:
-    """Deterministic chunk_id from (token_ids, ratio, level).
+    """Deterministic chunk_id from token_ids + compression params + model identity.
 
-    Exposed so offline `precompute_corpus.py` and online benchmark code can
-    construct the same disk cache key without going through `compress`.
+    Why all these keyword fields: the same token sequence at the same ratio
+    produces COMPLETELY DIFFERENT K/V tensors under different models /
+    tokenizers / dtypes. If we cache by `(token_ids, ratio, level)` alone,
+    a precomputed corpus from one model can collide with another model's
+    cache entries and the loader will silently return wrong KV.
+
+    All extra fields are keyword-only and OPTIONAL for legacy compatibility —
+    if not supplied, the key falls back to the original (token_ids, ratio,
+    level) form. Production callers (KVzipBackend.compress, offline
+    precompute scripts) SHOULD supply them; they will be filled in
+    automatically by `compress()` below.
+
+    Hardening tip: when sharing a cache directory across runs, always set
+    `model_id` and `tokenizer_id` at minimum.
     """
-    digest_input = (
-        ",".join(str(t) for t in token_ids)
-        + f"|ratio={ratio}"
-        + f"|level={level}"
-    )
+    parts = [
+        ",".join(str(t) for t in token_ids),
+        f"ratio={ratio}",
+        f"level={level}",
+        f"algo={algo_version}",
+    ]
+    # Optional identity fields — only included when supplied, so older keys
+    # remain reproducible. New callers should pass these.
+    if model_id is not None:      parts.append(f"model={model_id}")
+    if tokenizer_id is not None:  parts.append(f"tok={tokenizer_id}")
+    if dtype is not None:         parts.append(f"dtype={dtype}")
+    if n_layers is not None:      parts.append(f"L={n_layers}")
+    if n_kv_heads is not None:    parts.append(f"Hkv={n_kv_heads}")
+    if head_dim is not None:      parts.append(f"D={head_dim}")
+    digest_input = "|".join(parts)
     return f"{prefix}:{hashlib.sha256(digest_input.encode('utf-8')).hexdigest()[:16]}"
 
 
@@ -406,13 +436,23 @@ class KVzipBackend(CompressionBackendBase):
         # per process (`PYTHONHASHSEED`) so cross-process disk caches would
         # miss. We delegate to `kvzip_chunk_id` so the offline precompute
         # script and the online benchmark agree on the cache key.
+        #
+        # Include model/tokenizer/dtype/shape identity in the cache key to
+        # prevent cross-model contamination (see kvzip_chunk_id docstring).
+        tokenizer_id = getattr(mk.tokenizer, "name_or_path", None) or self.model_id
+        head_dim_meta = key_ctx[0].shape[-1] // n_kv_heads
         chunk_id = kvzip_chunk_id(
             chunk_token_ids,
             ratio=budget.ratio,
             level=self.kvzip_config.level,
             prefix=self.kvzip_config.chunk_id_prefix,
+            model_id=self.model_id,
+            tokenizer_id=tokenizer_id,
+            dtype=str(first_k.dtype),
+            n_layers=n_layers,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim_meta,
         )
-        tokenizer_id = getattr(mk.tokenizer, "name_or_path", None) or self.model_id
 
         # ── 6. structural — KVzip has no in-content sinks at this stage ──
         is_structural = torch.zeros(ctx_len, dtype=torch.bool, device=first_k.device)

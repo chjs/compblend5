@@ -43,6 +43,13 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "src"))
 sys.path.insert(0, str(_REPO / "src" / "external" / "cacheblend-hf-v7" / "src"))
 
+from compblend.verification import (
+    TokenizationInvariantError,
+    assert_compressed_storage_matches_tokens,
+    assert_kvzip_roundtrip_token_ids,
+    assert_token_ids_equal,
+)
+
 
 MODEL = os.environ.get("CACHEBLEND_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 DTYPE = os.environ.get("CACHEBLEND_DTYPE", "float16")
@@ -60,9 +67,19 @@ LOONG_MAX_LENGTH = int(os.environ.get("LOONG_MAX_LENGTH", "32000"))  # safety ca
 OUT_PATH = Path(os.environ.get("COMPBLEND_OUT", str(_REPO / "logs" / "loong_set1_sweep.json")))
 MAX_NEW_TOKENS = 64    # Loong answers can be slightly longer than MuSiQue's
 
-# Phase 1 keeps the sweep modest — 6 ratios × 3 gates = 18 grid cells per question.
+# CompBlend sweep grid: (KVzip ratio) × {hkvd_only, gated_top_k @ gate∈SWEEP_GATES}.
 SWEEP_RATIOS = [0.10, 0.20, 0.30, 0.50, 0.70]
 SWEEP_GATES = [0.3, 0.5, 1.0]
+
+# Additional reference arms (paper's "3 key comparisons"). On by default; set
+# env COMPBLEND_DENSE_BASELINES=0 / COMPBLEND_COMPRESSED_ONLY=0 to disable.
+RUN_DENSE_BASELINES = os.environ.get("COMPBLEND_DENSE_BASELINES", "1") == "1"
+RUN_COMPRESSED_ONLY = os.environ.get("COMPBLEND_COMPRESSED_ONLY", "1") == "1"
+# Dense CacheBlend = no KVzip, hkvd_only, vary recompute_ratio.
+DENSE_RECOMP_RATIOS = [0.05, 0.10, 0.15, 0.30]
+# KVzip compressed-only = recompute_ratio=0 over the compressed KV. Tests
+# what KVzip alone yields without any blending recompute.
+COMPRESSED_ONLY_RATIOS = [0.10, 0.30, 0.50]
 
 
 _WRAPPERS = {
@@ -213,29 +230,50 @@ def _load_loong_questions(
 # ── chunk construction (Loong-specific prompt format) ────────────────────
 
 
-def _build_chunks(tokenizer, sys_text: str, doc_contents: list[str], query_text: str):
-    """Build Chunk list matching Loong's prompt_template '{docs}\n\n{instruction}\n\n{question}'.
+def _build_chunks(
+    tokenizer,
+    user_open: str,
+    doc_contents: list[str],
+    query_suffix: str,
+) -> tuple[list, list[int], list[int]]:
+    """Loong chunk policy with explicit structural / compressible separation.
 
-    Each doc is its own chunk (KV will be compressed per chunk).
-    sys_text is empty for Loong (no system prompt convention).
-    Query is the instruction + question concatenated.
+    Layout:
+        chunks[0]      : structural prefix  = BOS + user_open   (uncompressed)
+        chunks[1..N]   : doc chunks         = one chunk per doc (compressed)
+        chunks[N+1]    : structural suffix  = instruction + question + assistant_open
+                                              (uncompressed)
+
+    Returns (chunks, structural_idx, compressible_idx). The benchmark loop
+    must compress chunks at `compressible_idx` and precompute the rest.
+
+    Each chunk is tokenized independently (add_special_tokens=False); BOS is
+    prepended once to chunks[0] via tokenizer.bos_token_id. The caller MUST
+    verify invariant I1 (concat == full tokenization) after building.
     """
     from cacheblend.chunker import Chunk, _stable_id
 
     bos = tokenizer.bos_token_id
-    chunk_texts = []
-    if sys_text:
-        chunk_texts.append(sys_text)
-    chunk_texts.extend(doc_contents)
-    chunk_texts.append(query_text)
-
     chunks = []
-    for i, text in enumerate(chunk_texts):
-        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-        if i == 0 and bos is not None:
-            ids = [bos] + ids
-        chunks.append(Chunk(text=text, token_ids=ids, chunk_id=_stable_id(text, ids)))
-    return chunks
+
+    # Structural prefix: BOS + chat user_open
+    pref_ids = tokenizer(user_open, add_special_tokens=False)["input_ids"]
+    if bos is not None:
+        pref_ids = [bos] + pref_ids
+    chunks.append(Chunk(text=user_open, token_ids=pref_ids, chunk_id=_stable_id(user_open, pref_ids)))
+
+    # Doc chunks (compressible)
+    for d_text in doc_contents:
+        d_ids = tokenizer(d_text, add_special_tokens=False)["input_ids"]
+        chunks.append(Chunk(text=d_text, token_ids=d_ids, chunk_id=_stable_id(d_text, d_ids)))
+
+    # Structural suffix: instruction + question + assistant_open
+    suf_ids = tokenizer(query_suffix, add_special_tokens=False)["input_ids"]
+    chunks.append(Chunk(text=query_suffix, token_ids=suf_ids, chunk_id=_stable_id(query_suffix, suf_ids)))
+
+    structural_idx = [0, len(chunks) - 1]
+    compressible_idx = list(range(1, len(chunks) - 1))
+    return chunks, structural_idx, compressible_idx
 
 
 def _greedy_decode(model, tokenizer, prefill_logits, past_kv, device, t_start):
@@ -346,24 +384,48 @@ def main() -> int:
 
     f1_full = []
     f1_arms: dict[tuple[float, str], list[float]] = {}
+    # Selector arm name normalization:
+    #   gated_top_k with gate_percentile in (0, 1)  → "gate={g}"
+    #   gated_top_k with gate_percentile == 1.0     → "no_gate"  (gate disabled)
+    def _arm_key_for_gate(g: float) -> str:
+        return "no_gate" if (g >= 1.0 or g <= 0.0) else f"gate={g}"
+
     for r in SWEEP_RATIOS:
         f1_arms[(r, "hkvd_only")] = []
         for g in SWEEP_GATES:
-            f1_arms[(r, f"gate={g}")] = []
+            f1_arms[(r, _arm_key_for_gate(g))] = []
+    # Reference arms (paper baselines).
+    dense_cb_f1: dict[float, list[float]] = {r: [] for r in DENSE_RECOMP_RATIOS}
+    compressed_only_f1: dict[float, list[float]] = {r: [] for r in COMPRESSED_ONLY_RATIOS}
+    skipped_questions: list[dict] = []
+    fallback_counts: dict[str, int] = {}    # arm_name → count of Qs where fallback occurred at least once
 
     for idx, ex in enumerate(eval_dataset):
       try:
         # Build prompt parts. Loong template = '{docs}\n\n{instruction}\n\n{question}'.
-        # We chunk by: sys (empty) + each doc + query (instruction+question wrapped).
-        query_text = f"\n\n{ex['instruction']}\n\n{ex['question']}{assistant_open}"
-        # First chunk gets user_open prepended; rest are docs.
-        first_doc = user_open + ex["doc_contents"][0]
-        rest_docs = ex["doc_contents"][1:]
-        chunks = _build_chunks(tokenizer, "", [first_doc, *rest_docs], query_text)
-        doc_slice = slice(0, len(ex["doc_contents"]))
+        query_suffix = f"\n\n{ex['instruction']}\n\n{ex['question']}{assistant_open}"
+        chunks, structural_idx, compressible_idx = _build_chunks(
+            tokenizer, user_open, ex["doc_contents"], query_suffix,
+        )
 
-        # Precompute sys/query (we put doc chunks at indices 0..N-1, query at last)
-        # But since "sys is empty" here, ALL doc chunks + query chunk need precomputing.
+        # ─── Invariant I1: full vs chunk concat tokenization ────────────────
+        # Stage 1 requires the fused-prompt token sequence to equal what the
+        # model would have seen with no chunking. BPE boundaries can break
+        # this; we detect it loudly here instead of comparing different
+        # prompt sequences in downstream F1/TTFT measurements.
+        full_text = user_open + "".join(ex["doc_contents"]) + query_suffix
+        expected_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
+        if tokenizer.bos_token_id is not None:
+            expected_ids = [tokenizer.bos_token_id] + expected_ids
+        actual_ids = [t for c in chunks for t in c.token_ids]
+        assert_token_ids_equal(
+            f"loong_q{idx + 1}_full_vs_chunks",
+            expected_ids, actual_ids, tokenizer,
+        )
+
+        # Precompute K/V for all chunks (structural and doc chunks alike — the
+        # doc chunks will be REPLACED by their compressed entries below; the
+        # structural prefix and suffix stay as plain fp16 K/V).
         kv_base = KVStore()
         for c in chunks:
             K, V = precompute_chunk_kv(lw, c)
@@ -379,32 +441,79 @@ def main() -> int:
         del out
         if device.type == "cuda": torch.cuda.empty_cache()
 
-        # Compress doc chunks once at ratio=1.0
+        # arms: dense CacheBlend (no KVzip) at varied recompute ratios.
+        # Same kv_base (full fp16 K/V, all-True valid_mask), selector=hkvd_only.
+        # These probe the dense-baseline behavior the paper's tables need.
+        dense_per_q: dict[float, float] = {}
+        if RUN_DENSE_BASELINES:
+            for dr in DENSE_RECOMP_RATIOS:
+                dcfg = CompBlendConfig(
+                    check_layer=CHECK_LAYER, recompute_ratio=dr,
+                    selector="hkvd_only", chunk_normalization="rank",
+                )
+                if device.type == "cuda": torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                flags_d: dict = {}
+                out = fuse_selective_compblend(
+                    lw, chunks, kv_base, dcfg,
+                    return_layerwise_output=True, last_logits_only=True,
+                    flags=flags_d,
+                )
+                res, _ = _greedy_decode(lw.model, tokenizer, out.logits, out.past_key_values, device, t0)
+                f1d = _compute_f1(res, ex["answer"], tokenizer) if isinstance(ex["answer"], str) else 0.0
+                dense_cb_f1[dr].append(f1d)
+                dense_per_q[dr] = f1d
+                if flags_d.get("per_head_mask_fallback_count", 0) > 0:
+                    arm = f"dense_cb_r={dr}"
+                    fallback_counts[arm] = fallback_counts.get(arm, 0) + 1
+                del out
+                if device.type == "cuda": torch.cuda.empty_cache()
+
+        # Compress ONLY the doc chunks (compressible_idx). Structural prefix
+        # and suffix stay as plain precomputed fp16 K/V in kv_base.
         compressed_1p0 = {}
         skip_question = False
-        for c in chunks[doc_slice]:
+        for ci in compressible_idx:
+            c = chunks[ci]
+            # ─── Invariant I2: KVzip decode→encode roundtrip ────────────────
+            # KVzip's backend does mk.tokenizer.decode(ids) → mk.prefill(text).
+            # That decode/encode must be the identity, else KVzip stores K/V
+            # for a different sequence than the caller's chunk.
+            try:
+                assert_kvzip_roundtrip_token_ids(
+                    f"loong_q{idx + 1}_chunk{ci}",
+                    c.token_ids,
+                    backend.tokenizer,
+                )
+            except TokenizationInvariantError as e:
+                print(f"[skip Q{idx + 1}] {e}", flush=True)
+                skip_question = True
+                break
             ids = torch.tensor([c.token_ids], dtype=torch.long, device=device)
             cmp = backend.compress(
                 ids, model=hf_model, budget=CompressionBudget(ratio=1.0),
             )
-            # KVzip decode/encode roundtrip can shift token count by 1+ for some
-            # texts (non-bijective tokenizer). The fuser overlays chunk KV onto
-            # positions [start, start + len(token_ids)] so a length mismatch
-            # corrupts position alignment. Skip the question rather than risk it.
-            if cmp.key_cache[0].shape[1] != len(c.token_ids):
-                print(
-                    f"[skip Q{idx+1}] chunk storage={cmp.key_cache[0].shape[1]} "
-                    f"!= len(token_ids)={len(c.token_ids)} (KVzip tokenizer drift)",
-                    flush=True,
+            # ─── Invariant I3: storage seq dim matches len(token_ids) ───────
+            try:
+                assert_compressed_storage_matches_tokens(
+                    f"loong_q{idx + 1}_chunk{ci}", cmp, c.token_ids,
                 )
+            except TokenizationInvariantError as e:
+                print(f"[skip Q{idx + 1}] {e}", flush=True)
                 skip_question = True
                 break
             compressed_1p0[c.chunk_id] = cmp
         if skip_question:
+            skipped_questions.append({"q": idx + 1, "ctx_len": ex.get("length", -1)})
             if device.type == "cuda": torch.cuda.empty_cache()
             continue
 
+        # Per-question reliability flags (aggregated across arms below).
+        per_q_flags: dict[str, dict] = {}
         per_q_summary = {"full": f1_full_q}
+        for r_d in dense_per_q:
+            per_q_summary[f"dense_cb_r{r_d}"] = dense_per_q[r_d]
+        co_per_q: dict[float, float] = {}
         for r in SWEEP_RATIOS:
             kv_r = KVStore()
             for c in chunks:
@@ -415,6 +524,28 @@ def main() -> int:
                 else:
                     kv_r._cache[c.chunk_id] = kv_base.get(c.chunk_id)
 
+            # arm: compressed_only — KVzip alone, recompute=0 (KV reuse path).
+            # Only runs for ratios in COMPRESSED_ONLY_RATIOS to keep cost bounded.
+            if RUN_COMPRESSED_ONLY and r in COMPRESSED_ONLY_RATIOS:
+                co_cfg = CompBlendConfig(
+                    check_layer=CHECK_LAYER, recompute_ratio=0.0,
+                    selector="hkvd_only", chunk_normalization="rank",
+                )
+                if device.type == "cuda": torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                # recompute_ratio=0 → fuse_full_reuse path (no selective recompute)
+                out = fuse_selective_compblend(
+                    lw, chunks, kv_r, co_cfg,
+                    return_layerwise_output=True, last_logits_only=False,
+                )
+                res, _ = _greedy_decode(lw.model, tokenizer, out.logits, out.past_key_values, device, t0)
+                f1_co = _compute_f1(res, ex["answer"], tokenizer) if isinstance(ex["answer"], str) else 0.0
+                compressed_only_f1[r].append(f1_co)
+                co_per_q[r] = f1_co
+                per_q_summary[f"compressed_only_r{r}"] = f1_co
+                del out
+                if device.type == "cuda": torch.cuda.empty_cache()
+
             # arm: hkvd_only
             cb_cfg = CompBlendConfig(
                 check_layer=CHECK_LAYER, recompute_ratio=RECOMP_RATIO,
@@ -422,14 +553,19 @@ def main() -> int:
             )
             if device.type == "cuda": torch.cuda.synchronize()
             t0 = time.perf_counter()
+            flags_h: dict = {}
             out = fuse_selective_compblend(
                 lw, chunks, kv_r, cb_cfg,
                 return_layerwise_output=True, last_logits_only=True,
+                flags=flags_h,
             )
             res, _ = _greedy_decode(lw.model, tokenizer, out.logits, out.past_key_values, device, t0)
             f1_h = _compute_f1(res, ex["answer"], tokenizer) if isinstance(ex["answer"], str) else 0.0
             f1_arms[(r, "hkvd_only")].append(f1_h)
             per_q_summary[f"r{r}_h"] = f1_h
+            per_q_flags[f"r{r}_h"] = flags_h
+            if flags_h.get("per_head_mask_fallback_count", 0) > 0:
+                fallback_counts[f"r{r}_h"] = fallback_counts.get(f"r{r}_h", 0) + 1
             del out
             if device.type == "cuda": torch.cuda.empty_cache()
 
@@ -441,22 +577,31 @@ def main() -> int:
                 )
                 if device.type == "cuda": torch.cuda.synchronize()
                 t0 = time.perf_counter()
+                flags_g: dict = {}
                 out = fuse_selective_compblend(
                     lw, chunks, kv_r, cb_cfg,
                     return_layerwise_output=True, last_logits_only=True,
+                    flags=flags_g,
                 )
                 res, _ = _greedy_decode(lw.model, tokenizer, out.logits, out.past_key_values, device, t0)
                 f1 = _compute_f1(res, ex["answer"], tokenizer) if isinstance(ex["answer"], str) else 0.0
-                f1_arms[(r, f"gate={g}")].append(f1)
-                per_q_summary[f"r{r}_g{g}"] = f1
+                arm_key = _arm_key_for_gate(g)
+                f1_arms[(r, arm_key)].append(f1)
+                per_q_summary[f"r{r}_{arm_key}"] = f1
+                per_q_flags[f"r{r}_{arm_key}"] = flags_g
+                if flags_g.get("per_head_mask_fallback_count", 0) > 0:
+                    fallback_counts[f"r{r}_{arm_key}"] = fallback_counts.get(f"r{r}_{arm_key}", 0) + 1
                 del out
                 if device.type == "cuda": torch.cuda.empty_cache()
+
+        def _best_gate_for_ratio(r: float) -> float:
+            return max(per_q_summary[f"r{r}_{_arm_key_for_gate(g)}"] for g in SWEEP_GATES)
 
         print(
             f"[{idx + 1}/{len(eval_dataset)}] type={ex['type'][:3]} ctx_len={ex.get('length',-1):>6}  "
             f"full={f1_full_q:.2f}  " +
             "  ".join(
-                f"r{r}:h={per_q_summary[f'r{r}_h']:.2f}/best={max(per_q_summary[f'r{r}_g{g}'] for g in SWEEP_GATES):.2f}"
+                f"r{r}:h={per_q_summary[f'r{r}_h']:.2f}/best={_best_gate_for_ratio(r):.2f}"
                 for r in SWEEP_RATIOS
             ),
             flush=True,
@@ -482,29 +627,86 @@ def main() -> int:
         "config": {
             "model": MODEL, "dtype": DTYPE, "attn_impl": ATTN_IMPL,
             "recomp_ratio": RECOMP_RATIO, "check_layer": CHECK_LAYER,
-            "n": len(eval_dataset),
+            "n_loaded": len(eval_dataset),
+            "n_evaluated": len(f1_full),
+            "n_skipped": len(skipped_questions),
+            "skipped_questions": skipped_questions,
             "sweep_ratios": SWEEP_RATIOS, "sweep_gates": SWEEP_GATES,
+            "loong_levels": LOONG_LEVELS,
+            "loong_sets": LOONG_SETS,
+            "loong_max_length": LOONG_MAX_LENGTH,
+            "language": "en",
+            "answer_type_filter": "str",
             "dataset": f"Loong levels={LOONG_LEVELS} sets={LOONG_SETS} lang=en (str answers only)",
             "kvzip_level": "pair",
-            "valid_mask_source": "_derive_valid_mask_pair (verbatim from KVzip._threshold)",
+            "valid_mask_source": "_derive_valid_mask_pair (verbatim KVzip._threshold; no cross-check vs kv.prune yet — see tests/test_m6)",
             "metric": "token-F1 (substring) — NOT Loong's official LLM-judge",
+            "stage": "Stage 1",
+            "stage_notes": "Dense [1, total_seq, H_kv*D] workspace per layer. Compressed-native sparse KV is Stage 2.",
+            "chunk_policy": "[BOS+user_open](structural) + [docs](compressed) + [query+assistant_open](structural)",
+            "selector_naming": "hkvd_only = HKVD top-k; gate=g (0<g<1) = Gated HKVD; no_gate = gated_top_k with gate_percentile=1.0 (gate disabled)",
         },
         "f1": {"full_mean": _mean(f1_full), "grid": {}},
         "n_per_arm": len(f1_full),
+        "reliability_flags": {
+            "per_head_mask_fallback_arms": fallback_counts,
+            "per_head_mask_fallback_note": (
+                "Count = number of questions where per-head SDPA mask hit the cap "
+                "in at least one layer and fell back to causal-only. With fallback, "
+                "evicted KV positions still occupy softmax denominator (V=0 so output "
+                "contribution is zero, but softmax weighting of kept tokens is diluted). "
+                "Exact per-head masking is achieved only when fallback_arms count == 0."
+            ),
+        },
     }
     for r in SWEEP_RATIOS:
         hkvd = np.array(f1_arms[(r, "hkvd_only")])
         row = {"hkvd_only_mean": float(np.mean(hkvd)) if len(hkvd) else float("nan"), "gates": {}}
         for g in SWEEP_GATES:
-            gated = np.array(f1_arms[(r, f"gate={g}")])
+            arm_key = _arm_key_for_gate(g)
+            gated = np.array(f1_arms[(r, arm_key)])
             deltas = gated - hkvd if len(gated) else np.zeros(0)
             ci, sig = _boot_ci(deltas) if len(deltas) else ([0.0, 0.0], False)
             row["gates"][str(g)] = {
+                "arm_name": arm_key,
+                "is_gated_hkvd": (arm_key != "no_gate"),
                 "mean": float(np.mean(gated)) if len(gated) else float("nan"),
                 "delta_minus_hkvd_mean": float(np.mean(deltas)) if len(deltas) else 0.0,
                 "delta_ci_95": ci, "delta_significant": sig,
             }
         summary["f1"]["grid"][str(r)] = row
+
+    # Reference baselines: dense CacheBlend + KVzip compressed-only.
+    summary["f1"]["dense_cacheblend"] = {
+        str(dr): {
+            "mean": _mean(dense_cb_f1[dr]),
+            "n": len(dense_cb_f1[dr]),
+            "description": "No KVzip; selector=hkvd_only; recompute_ratio varied",
+        }
+        for dr in DENSE_RECOMP_RATIOS
+    } if RUN_DENSE_BASELINES else None
+
+    summary["f1"]["compressed_only"] = {
+        str(cr): {
+            "mean": _mean(compressed_only_f1[cr]),
+            "n": len(compressed_only_f1[cr]),
+            "description": "KVzip ratio=cr; recompute_ratio=0 (KV reuse, no selective recompute)",
+        }
+        for cr in COMPRESSED_ONLY_RATIOS
+    } if RUN_COMPRESSED_ONLY else None
+
+    # Key comparisons (for paper interpretation).
+    summary["f1"]["key_comparisons"] = {
+        "dense_cb_r0.15_vs_compblend_gate0.3_r0.10": (
+            "same / lower recompute via Gated HKVD on compressed KV → check F1 parity"
+        ),
+        "dense_cb_r0.10_vs_compblend_gate0.3_r0.10": (
+            "same recompute, KVzip + importance gating effect"
+        ),
+        "compblend_hkvd_only_r0.10_vs_compblend_gate0.3_r0.10": (
+            "on identical compressed KV, gate helps?"
+        ),
+    }
 
     print("\n──────── Summary ────────")
     print(json.dumps(summary, indent=2))

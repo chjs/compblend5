@@ -38,6 +38,13 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "src"))
 sys.path.insert(0, str(_REPO / "src" / "external" / "cacheblend-hf-v7" / "src"))
 
+from compblend.verification import (
+    TokenizationInvariantError,
+    assert_compressed_storage_matches_tokens,
+    assert_kvzip_roundtrip_token_ids,
+    assert_token_ids_equal,
+)
+
 MODEL = os.environ.get("CACHEBLEND_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 DTYPE = os.environ.get("CACHEBLEND_DTYPE", "float16")
 ATTN_IMPL = os.environ.get("CACHEBLEND_ATTN_IMPL", "sdpa")
@@ -70,16 +77,39 @@ def _resolve_wrapper(model_id, tokenizer):
     raise RuntimeError(f"add wrapper for {model_id}")
 
 
-def _build_chunks(tokenizer, doc_contents, query_text, user_open):
+def _build_chunks(
+    tokenizer,
+    doc_contents: list[str],
+    query_suffix: str,
+    user_open: str,
+) -> tuple[list, list[int], list[int]]:
+    """Loong chunk policy: structural prefix + doc chunks + structural suffix.
+
+    Layout:
+        chunks[0]      : structural prefix  = BOS + user_open   (uncompressed)
+        chunks[1..N]   : doc chunks         = one per doc       (compressed)
+        chunks[N+1]    : structural suffix  = query_suffix      (uncompressed)
+    Returns (chunks, structural_idx, compressible_idx).
+    """
     from cacheblend.chunker import Chunk, _stable_id
     bos = tokenizer.bos_token_id
     chunks = []
-    chunk_texts = [user_open + doc_contents[0]] + list(doc_contents[1:]) + [query_text]
-    for i, text in enumerate(chunk_texts):
-        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-        if i == 0 and bos is not None: ids = [bos] + ids
-        chunks.append(Chunk(text=text, token_ids=ids, chunk_id=_stable_id(text, ids)))
-    return chunks
+
+    pref_ids = tokenizer(user_open, add_special_tokens=False)["input_ids"]
+    if bos is not None:
+        pref_ids = [bos] + pref_ids
+    chunks.append(Chunk(text=user_open, token_ids=pref_ids, chunk_id=_stable_id(user_open, pref_ids)))
+
+    for d_text in doc_contents:
+        d_ids = tokenizer(d_text, add_special_tokens=False)["input_ids"]
+        chunks.append(Chunk(text=d_text, token_ids=d_ids, chunk_id=_stable_id(d_text, d_ids)))
+
+    suf_ids = tokenizer(query_suffix, add_special_tokens=False)["input_ids"]
+    chunks.append(Chunk(text=query_suffix, token_ids=suf_ids, chunk_id=_stable_id(query_suffix, suf_ids)))
+
+    structural_idx = [0, len(chunks) - 1]
+    compressible_idx = list(range(1, len(chunks) - 1))
+    return chunks, structural_idx, compressible_idx
 
 
 def _measure_full_recompute(lw, chunks, device) -> float:
@@ -194,8 +224,21 @@ def main() -> int:
     samples = []
     for idx, ex in enumerate(questions):
       try:
-        query_text = f"\n\n{ex['instruction']}\n\n{ex['question']}"
-        chunks = _build_chunks(tokenizer, ex["doc_contents"], query_text, user_open)
+        query_suffix = f"\n\n{ex['instruction']}\n\n{ex['question']}"
+        chunks, structural_idx, compressible_idx = _build_chunks(
+            tokenizer, ex["doc_contents"], query_suffix, user_open,
+        )
+
+        # Invariant I1: full vs concat tokenization
+        full_text = user_open + "".join(ex["doc_contents"]) + query_suffix
+        expected_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
+        if tokenizer.bos_token_id is not None:
+            expected_ids = [tokenizer.bos_token_id] + expected_ids
+        actual_ids = [t for c in chunks for t in c.token_ids]
+        assert_token_ids_equal(
+            f"loong_q{idx + 1}_full_vs_chunks",
+            expected_ids, actual_ids, tokenizer,
+        )
 
         # Precompute KV store (no compression — baseline)
         kv_nozip = KVStore()
@@ -208,6 +251,7 @@ def main() -> int:
 
         # CacheBlend baseline (instrumented)
         timings_cb: dict = {}
+        flags_cb: dict = {}
         cb_cfg = CompBlendConfig(
             check_layer=CHECK_LAYER, recompute_ratio=RECOMP_RATIO,
             selector="hkvd_only", chunk_normalization="none",
@@ -216,30 +260,30 @@ def main() -> int:
             lw, chunks, kv_nozip, cb_cfg,
             return_layerwise_output=True, timings=timings_cb,
             last_logits_only=True,
+            flags=flags_cb,
         )
         if device.type == "cuda": torch.cuda.empty_cache()
 
-        # CompBlend with KVzip — compress each doc, build new kv_store
-        doc_slice = slice(0, len(ex["doc_contents"]))
+        # CompBlend with KVzip — compress doc chunks (compressible_idx) only.
+        # Structural prefix/suffix stay as plain precomputed fp16 K/V.
         kv_zip = KVStore()
-        for c in chunks:
-            if c is chunks[-1] or c is chunks[0] and ex.get("__no_user_open__", False):
-                # query chunk — never compressed
+        for i, c in enumerate(chunks):
+            if i in structural_idx:
                 kv_zip._cache[c.chunk_id] = kv_nozip.get(c.chunk_id)
                 continue
-            # doc chunks — compress
+            # Doc chunk: verify roundtrip then compress.
+            assert_kvzip_roundtrip_token_ids(
+                f"loong_q{idx + 1}_chunk{i}", c.token_ids, backend.tokenizer,
+            )
             ids = torch.tensor([c.token_ids], dtype=torch.long, device=device)
             cmp = backend.compress(ids, model=hf_model, budget=CompressionBudget(ratio=KVZIP_RATIO))
-            if cmp.key_cache[0].shape[1] != len(c.token_ids):
-                raise RuntimeError(
-                    f"KVzip tokenizer drift: storage={cmp.key_cache[0].shape[1]} "
-                    f"!= len(token_ids)={len(c.token_ids)}"
-                )
+            assert_compressed_storage_matches_tokens(
+                f"loong_q{idx + 1}_chunk{i}", cmp, c.token_ids,
+            )
             kv_zip._cache[c.chunk_id] = to_kvstore_entry(cmp)
-        # ensure query chunk (last) is precomputed-fresh
-        kv_zip._cache[chunks[-1].chunk_id] = kv_nozip.get(chunks[-1].chunk_id)
 
         timings_compblend: dict = {}
+        flags_compblend: dict = {}
         compblend_cfg = CompBlendConfig(
             check_layer=CHECK_LAYER, recompute_ratio=RECOMP_RATIO,
             selector="gated_top_k", gate_percentile=GATE_PCT,
@@ -249,6 +293,7 @@ def main() -> int:
             lw, chunks, kv_zip, compblend_cfg,
             return_layerwise_output=True, timings=timings_compblend,
             last_logits_only=True,
+            flags=flags_compblend,
         )
         if device.type == "cuda": torch.cuda.empty_cache()
 
@@ -258,6 +303,8 @@ def main() -> int:
             "full_recompute_ms": t_full,
             "cacheblend": timings_cb,
             "compblend": timings_compblend,
+            "cacheblend_flags": flags_cb,
+            "compblend_flags": flags_compblend,
         }
         samples.append(sample)
         # Compact log
@@ -282,18 +329,59 @@ def main() -> int:
         return {"mean": float(arr.mean()), "stdev": float(arr.std()), "n": len(xs)}
 
     keys = ["io_embed_rotary", "kv_load", "full_prefix", "hkvd_select", "check_layer", "sparse_layers", "lmhead"]
+    # Aggregate reliability flags across all samples.
+    def _flag_count(samples_list, side: str, key: str) -> int:
+        return sum(
+            1 for s in samples_list
+            if s.get(f"{side}_flags", {}).get(key, 0) > 0
+        )
+
+    cb_fallback_n = _flag_count(samples, "cacheblend", "per_head_mask_fallback_count")
+    cp_fallback_n = _flag_count(samples, "compblend",  "per_head_mask_fallback_count")
+    cp_exact_n    = _flag_count(samples, "compblend",  "per_head_mask_exact_count")
+    cp_workspace_bytes = [
+        s.get("compblend_flags", {}).get("dense_workspace_bytes", 0) for s in samples
+    ]
+
+    gate_label = "no_gate" if (GATE_PCT >= 1.0 or GATE_PCT <= 0.0) else f"gate={GATE_PCT}"
+
     summary = {
         "config": {
             "model": MODEL, "n": len(samples),
             "kvzip_ratio": KVZIP_RATIO, "recomp_ratio": RECOMP_RATIO,
-            "gate_pct": GATE_PCT, "check_layer": CHECK_LAYER,
+            "gate_pct": GATE_PCT,
+            "gate_label": gate_label,
+            "gate_is_active": (gate_label != "no_gate"),
+            "check_layer": CHECK_LAYER,
+            "loong_levels": LOONG_LEVELS,
+            "loong_sets": LOONG_SETS,
+            "loong_max_length": LOONG_MAX_LENGTH,
             "dataset": f"Loong levels={LOONG_LEVELS} sets={LOONG_SETS} en len<={LOONG_MAX_LENGTH}",
+            "stage": "Stage 1",
+            "stage_notes": "Dense [1, total_seq, H_kv*D] workspace per layer; compressed-native KV is Stage 2.",
+            "chunk_policy": "[BOS+user_open](structural) + [docs](compressed) + [query](structural)",
         },
         "full_recompute_ms": _stat([s["full_recompute_ms"] for s in samples]),
         "cacheblend_ms": {k: _stat([s["cacheblend"].get(k, 0) for s in samples]) for k in keys},
         "compblend_ms":  {k: _stat([s["compblend"].get(k, 0) for s in samples]) for k in keys},
         "cacheblend_total_ms": _stat([s["cacheblend"].get("_total_ms", 0) for s in samples]),
         "compblend_total_ms":  _stat([s["compblend"].get("_total_ms", 0) for s in samples]),
+        "reliability_flags": {
+            "cacheblend_fallback_questions": cb_fallback_n,
+            "compblend_fallback_questions": cp_fallback_n,
+            "compblend_exact_mask_questions": cp_exact_n,
+            "compblend_dense_workspace_bytes_max": int(max(cp_workspace_bytes) if cp_workspace_bytes else 0),
+            "compblend_dense_workspace_bytes_mean": float(
+                sum(cp_workspace_bytes) / len(cp_workspace_bytes)
+            ) if cp_workspace_bytes else 0.0,
+            "note": (
+                "fallback_questions = number of Qs where the per-head SDPA mask hit "
+                "ATTN_MASK_MEMORY_CAP_BYTES and was downgraded to causal-only at one "
+                "or more layers. If fallback_questions > 0, the timing/F1 numbers "
+                "reflect causal-only attention with zero-filled K/V, NOT exact "
+                "per-head valid_mask enforcement."
+            ),
+        },
         "per_sample": samples,
     }
     print("\n──────── BREAKDOWN SUMMARY ────────")
