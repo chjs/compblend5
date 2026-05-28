@@ -35,6 +35,7 @@ What we keep from CompBlend-old's adapter
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -184,20 +185,34 @@ class KVzipBackend(CompressionBackendBase):
         pre_v_all: dict[int, list[torch.Tensor]] = {}
         handles = self._install_hooks(mk, pre_rope_k_all, pre_v_all)
 
+        # ----- Context fix (2026-05-29) -----
+        # Default KVzip prefills as `[sys_prompt + chunk]`, so the captured K, V
+        # carry KVzip's "You are a helpful assistant ..." system context. When
+        # we splice that K, V into a CacheBlend fused prompt where the doc sits
+        # under a DIFFERENT prefix (chat user_open + instruction), the attention
+        # pattern doesn't match what the model expects → catastrophic F1 at
+        # rr=0. precompute_chunk_kv (used for structural prefix/suffix) does
+        # standalone forward (no prefix). To make doc K, V comparable, we
+        # temporarily clear mk.sys_prompt_ids so the prefill runs over the
+        # chunk ALONE (no KVzip sys context).
+        #
+        # Toggle via COMPBLEND_KVZIP_NO_SYS_PROMPT=1 (default ON post-2026-05-29).
+        no_sys = os.environ.get("COMPBLEND_KVZIP_NO_SYS_PROMPT", "1") == "1"
+        original_sys = None
+        if no_sys:
+            original_sys = mk.sys_prompt_ids
+            mk.sys_prompt_ids = torch.zeros(
+                (1, 0), dtype=original_sys.dtype, device=original_sys.device,
+            )
+
         try:
-            # KVzip accepts both tensor and text — but its internal chunked
-            # scoring task has a buggy length-accounting at very large ctx
-            # (>~20K). Empirically: passing tensor directly fails the
-            # `kv.score[0].shape[-1] == kv.ctx_len` assertion at long context;
-            # going through decode→encode happens to bring the token count
-            # within scoring's tolerance because tokenizer.decode→encode of
-            # Llama is roughly idempotent for clean text (and where it isn't,
-            # the bench's I2 invariant catches it). Use text path.
             text = self._ids_to_text(mk, input_ids)
             kv = mk.prefill(text, load_score=False, do_score=True)
         finally:
             for h in handles:
                 h.remove()
+            if original_sys is not None:
+                mk.sys_prompt_ids = original_sys
 
         # ----- 2. Apply pruning to populate kv.valid + kv.score -----
         # ratio=1.0 → all-True mask, score still computed.
