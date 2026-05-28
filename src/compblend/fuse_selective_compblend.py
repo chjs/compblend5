@@ -208,6 +208,9 @@ def _build_attn_mask_with_per_head_valid(
         # No per-head eviction — sparse_causal alone is correct.
         if flags is not None:
             flags["per_head_mask_required"] = flags.get("per_head_mask_required", False)
+            flags.setdefault("per_head_mask_unnecessary_layers", []).append(
+                int(flags.get("_check_layer_idx", flags.get("_sparse_layer_idx", -1)))
+            )
         return sparse_causal
 
     # Memory guard: at long context the full [1, H_q, Q, K] mask exceeds GPU
@@ -226,6 +229,9 @@ def _build_attn_mask_with_per_head_valid(
     K = int(total_seq)
     H_q = int(valid_layer.shape[0]) * int(n_rep)
     mask_bytes = 1 * H_q * Q * K * bytes_per_elem
+    cur_layer = -1
+    if flags is not None:
+        cur_layer = int(flags.get("_check_layer_idx", flags.get("_sparse_layer_idx", -1)))
     if mask_bytes > ATTN_MASK_MEMORY_CAP_BYTES:
         # Fallback: causal-only mask. Evicted positions still contribute
         # near-zero (zero-filled K/V × softmax). Print fallback once-per-call
@@ -238,6 +244,9 @@ def _build_attn_mask_with_per_head_valid(
             flags["per_head_mask_max_bytes"] = max(
                 flags.get("per_head_mask_max_bytes", 0), mask_bytes
             )
+            flags["attn_mask_memory_cap_bytes"] = ATTN_MASK_MEMORY_CAP_BYTES
+            flags.setdefault("per_head_mask_fallback_layers", []).append(cur_layer)
+            flags["fallback_reason"] = "mask_bytes > ATTN_MASK_MEMORY_CAP_BYTES"
         import sys as _sys
         print(
             f"[fuser] per-head mask too large "
@@ -254,6 +263,10 @@ def _build_attn_mask_with_per_head_valid(
         flags["per_head_mask_exact_count"] = flags.get(
             "per_head_mask_exact_count", 0
         ) + 1
+        flags.setdefault("per_head_mask_exact_layers", []).append(cur_layer)
+        flags["largest_attn_mask_estimated_bytes"] = max(
+            flags.get("largest_attn_mask_estimated_bytes", 0), mask_bytes
+        )
 
     # Step 3: additive form. 0 where valid, -inf where evicted.
     # Cast carefully — sparse_causal is in model dtype (fp16/bf16/fp32).
@@ -374,6 +387,7 @@ def fuse_selective_compblend(
     timings: dict | None = None,
     last_logits_only: bool = False,
     flags: dict | None = None,
+    selector_stats: dict | None = None,
 ):
     """Paper §4 selective recompute + paper §3 Gated HKVD + per-head mask.
 
@@ -577,12 +591,16 @@ def fuse_selective_compblend(
 
         residual_full = hidden_states
         h_normed = layer_ck.input_layernorm(hidden_states)
+        timer.mark("check_input_ln")
+
         q_full = attn_ck.q_proj(h_normed)                # (1, S, num_heads*D)
         k_full_pre = attn_ck.k_proj(h_normed)            # (1, S, hidden_kv)
         v_full = attn_ck.v_proj(h_normed)
+        timer.mark("check_qkv_proj")
 
         # HKVD on pre-RoPE K (RoPE preserves L2 — same result as post-RoPE).
         deviations = kv_deviation(k_full_pre, K_stored_pre[config.check_layer])
+        timer.mark("check_hkvd_score")
 
         # Forced positions: last position (greedy decode needs valid logits).
         # In Stage 1, all chunks are required to be in KVStore, so there
@@ -610,7 +628,51 @@ def fuse_selective_compblend(
 
         is_top = torch.zeros(total_seq, dtype=torch.bool, device=device)
         is_top[top_indices] = True
-        timer.mark("hkvd_select")
+        timer.mark("check_selector")
+        # Backward-compat alias for old "hkvd_select" key — sum of hkvd_score + selector.
+        if timings is not None:
+            timer.events["hkvd_select"] = (
+                timer.events.get("check_hkvd_score", 0.0)
+                + timer.events.get("check_selector", 0.0)
+            )
+
+        # ─── Selector statistics ────────────────────────────────────────
+        if selector_stats is not None:
+            structural_mask_cpu = structural_full.to(torch.bool)
+            eligible_mask_cpu = eligible_full.to(torch.bool)
+            forced_mask_cpu = forced_mask.to(torch.bool)
+            is_top_cpu = is_top.to(torch.bool)
+            n_total = int(total_seq)
+            n_struct = int(structural_mask_cpu.sum().item())
+            n_eligible = int(eligible_mask_cpu.sum().item())
+            n_forced = int(forced_mask_cpu.sum().item())
+            n_selected = int(is_top_cpu.sum().item())
+            # Overlap with structural (selected positions that are structural)
+            n_sel_from_struct = int((is_top_cpu & structural_mask_cpu).sum().item())
+            selector_stats.update({
+                "total_tokens": n_total,
+                "structural_tokens": n_struct,
+                "compressible_tokens": n_total - n_struct,
+                "eligible_tokens": n_eligible,
+                "ineligible_tokens": n_total - n_eligible,
+                "forced_tokens": n_forced,
+                "selected_recompute_tokens": n_selected,
+                "selected_from_structural_tokens": n_sel_from_struct,
+                "selected_from_compressible_tokens": n_selected - n_sel_from_struct,
+                "recompute_ratio_requested": float(config.recompute_ratio),
+                "selected_ratio_actual": (n_selected / n_total) if n_total else 0.0,
+                "eligible_ratio": (n_eligible / n_total) if n_total else 0.0,
+                "selector": str(config.selector),
+                "gate_percentile": (
+                    float(config.gate_percentile)
+                    if config.selector == "gated_top_k"
+                    else None
+                ),
+                "gate_is_active": (
+                    config.selector == "gated_top_k"
+                    and 0.0 < float(config.gate_percentile) < 1.0
+                ),
+            })
 
         # Mixed K_pre, V: cached at non-top, fresh at top.
         k_mixed_pre = k_full_pre.clone()
@@ -618,6 +680,7 @@ def fuse_selective_compblend(
         non_top_mask = ~is_top
         k_mixed_pre[:, non_top_mask, :] = K_stored_pre[config.check_layer][:, non_top_mask, :]
         v_mixed[:, non_top_mask, :] = V_stored[config.check_layer][:, non_top_mask, :]
+        timer.mark("check_kv_mix")
 
         # Reshape to heads.
         hidden_shape_full = (1, total_seq, -1, head_dim)
@@ -633,10 +696,13 @@ def fuse_selective_compblend(
         # Slice Q to top_indices.
         q_sparse_post = q_full_heads_post[:, :, top_indices, :]
         residual_sparse = residual_full[:, top_indices, :]
+        timer.mark("check_rope")
 
         past_key_values.update(k_full_post, v_mixed_heads, config.check_layer)
 
         # CompBlend extension: per-head valid_mask in SDPA attn_mask.
+        if flags is not None:
+            flags["_check_layer_idx"] = int(config.check_layer)
         attn_mask_ck = _build_attn_mask_with_per_head_valid(
             causal_mask_full=causal_mask_full,
             top_indices=top_indices,
@@ -647,6 +713,7 @@ def fuse_selective_compblend(
             mask_dtype=causal_mask_full.dtype,
             flags=flags,
         )
+        timer.mark("check_attn_mask_build")
 
         # GQA expansion of K/V.
         k_rep = k_full_post.repeat_interleave(n_rep, dim=1)
@@ -659,7 +726,10 @@ def fuse_selective_compblend(
         attn_out_ck = attn_out_ck.transpose(1, 2).reshape(
             1, topk_num, num_heads * head_dim,
         ).contiguous()
+        timer.mark("check_attention_sdpa")
+
         attn_out_ck = attn_ck.o_proj(attn_out_ck)
+        timer.mark("check_o_proj")
 
         # Residual + FFN, sparse.
         h_sparse = residual_sparse + attn_out_ck
@@ -667,7 +737,15 @@ def fuse_selective_compblend(
         h_sparse_normed = layer_ck.post_attention_layernorm(h_sparse)
         h_sparse = layer_ck.mlp(h_sparse_normed)
         h_sparse = residual_sparse2 + h_sparse
-        timer.mark("check_layer")
+        timer.mark("check_ffn")
+
+        # Roll-up: backward-compatible "check_layer" key = sum of all check_* events
+        # for callers that still read the coarse name.
+        if timings is not None:
+            timer.events["check_layer"] = sum(
+                v for k, v in timer.events.items() if k.startswith("check_")
+                and k not in ("check_layer",)
+            )
 
         # ── Layers check_layer+1..n_layers-1: sparse hidden, mixed K/V ──
         cos_sparse = cos_full[:, top_indices, :]
@@ -679,10 +757,12 @@ def fuse_selective_compblend(
 
             residual_sparse_in = h_sparse
             h_normed_sparse = layer_li.input_layernorm(h_sparse)
+            timer.mark("sparse_input_ln")
 
             q_sparse = attn_li.q_proj(h_normed_sparse)
             k_sparse_pre = attn_li.k_proj(h_normed_sparse)
             v_sparse = attn_li.v_proj(h_normed_sparse)
+            timer.mark("sparse_qkv_proj")
 
             sparse_shape = (1, topk_num, -1, head_dim)
             q_sparse_heads = q_sparse.view(sparse_shape).transpose(1, 2)
@@ -692,6 +772,7 @@ def fuse_selective_compblend(
             q_sparse_post, k_sparse_post = apply_rotary_pos_emb(
                 q_sparse_heads, k_sparse_heads_pre, cos_sparse, sin_sparse,
             )
+            timer.mark("sparse_rope")
 
             # Build full K cache: cached(RoPE-shifted) at non-top, fresh at top.
             k_cached_pre_full = K_stored_pre[li]                              # (1, S, hidden_kv)
@@ -712,8 +793,11 @@ def fuse_selective_compblend(
             v_full_li[:, :, top_indices, :] = v_sparse_heads
 
             past_key_values.update(k_full_li, v_full_li, li)
+            timer.mark("sparse_kv_mix")
 
             # Per-head mask for this layer (mirrors check_layer).
+            if flags is not None:
+                flags["_sparse_layer_idx"] = int(li)
             attn_mask_li = _build_attn_mask_with_per_head_valid(
                 causal_mask_full=causal_mask_full,
                 top_indices=top_indices,
@@ -724,6 +808,7 @@ def fuse_selective_compblend(
                 mask_dtype=causal_mask_full.dtype,
                 flags=flags,
             )
+            timer.mark("sparse_attn_mask_build")
 
             k_rep_li = k_full_li.repeat_interleave(n_rep, dim=1)
             v_rep_li = v_full_li.repeat_interleave(n_rep, dim=1)
@@ -735,14 +820,24 @@ def fuse_selective_compblend(
             attn_out_li = attn_out_li.transpose(1, 2).reshape(
                 1, topk_num, num_heads * head_dim,
             ).contiguous()
+            timer.mark("sparse_attention_sdpa")
+
             attn_out_li = attn_li.o_proj(attn_out_li)
+            timer.mark("sparse_o_proj")
 
             h_sparse = residual_sparse_in + attn_out_li
             residual_sparse_in2 = h_sparse
             h_sparse_normed = layer_li.post_attention_layernorm(h_sparse)
             h_sparse = layer_li.mlp(h_sparse_normed)
             h_sparse = residual_sparse_in2 + h_sparse
-        timer.mark("sparse_layers")
+            timer.mark("sparse_ffn")
+
+        # Roll-up: backward-compatible "sparse_layers" key = sum of all sparse_* events.
+        if timings is not None:
+            timer.events["sparse_layers"] = sum(
+                v for k, v in timer.events.items() if k.startswith("sparse_")
+                and k not in ("sparse_layers",)
+            )
 
         # ── Final norm + lm_head on SPARSE hidden ──────────────────────
         h_sparse_normed = inner.norm(h_sparse)
@@ -761,10 +856,33 @@ def fuse_selective_compblend(
             logits_full[:, top_indices, :] = logits_sparse
         timer.mark("lmhead")
 
-    # Stash timing events on the caller's dict (if provided)
+    # Stash timing events on the caller's dict (if provided).
+    # _total_ms excludes coarse rollup keys ("check_layer", "sparse_layers",
+    # "hkvd_select") to avoid double-counting when fine-grained keys are present.
+    _ROLLUP_KEYS = {"check_layer", "sparse_layers", "hkvd_select"}
     if timings is not None:
         timings.update(timer.events)
-        timings["_total_ms"] = sum(timer.events.values())
+        timings["_total_ms"] = sum(
+            v for k, v in timer.events.items() if k not in _ROLLUP_KEYS
+        )
+
+    # Compute actual KVzip retention ratio from the assembled valid_mask.
+    # `valid_mask_full[L, H_kv, S]` was filled chunk-by-chunk during kv_load;
+    # for chunks without a valid_mask entry (structural prefix/suffix) the
+    # default was all-True (see _load_chunk_extensions). The "kvzip_ratio_actual"
+    # measures the kept fraction over the full (L, H_kv, S) tensor — useful to
+    # see how much KVzip's pair-level eviction actually dropped vs the
+    # requested ratio.
+    if flags is not None:
+        try:
+            stored_kv_valid_ratio = float(valid_mask_full.float().mean().item())
+        except Exception:
+            stored_kv_valid_ratio = -1.0
+        flags["stored_kv_valid_ratio"] = stored_kv_valid_ratio
+        flags["kvzip_ratio_actual"] = stored_kv_valid_ratio
+        # Strip internal helper keys before returning to caller.
+        flags.pop("_check_layer_idx", None)
+        flags.pop("_sparse_layer_idx", None)
 
     out_obj = LayerwiseOutput(logits=logits_full, past_key_values=past_key_values)
     result = out_obj if return_layerwise_output else logits_full
