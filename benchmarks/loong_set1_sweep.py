@@ -400,7 +400,6 @@ def main() -> int:
                 break
             compressed_1p0[c.chunk_id] = cmp
         if skip_question:
-            del out  # free full_recompute reference
             if device.type == "cuda": torch.cuda.empty_cache()
             continue
 
