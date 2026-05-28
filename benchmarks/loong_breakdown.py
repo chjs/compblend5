@@ -193,6 +193,7 @@ def main() -> int:
 
     samples = []
     for idx, ex in enumerate(questions):
+      try:
         query_text = f"\n\n{ex['instruction']}\n\n{ex['question']}"
         chunks = _build_chunks(tokenizer, ex["doc_contents"], query_text, user_open)
 
@@ -229,6 +230,11 @@ def main() -> int:
             # doc chunks — compress
             ids = torch.tensor([c.token_ids], dtype=torch.long, device=device)
             cmp = backend.compress(ids, model=hf_model, budget=CompressionBudget(ratio=KVZIP_RATIO))
+            if cmp.key_cache[0].shape[1] != len(c.token_ids):
+                raise RuntimeError(
+                    f"KVzip tokenizer drift: storage={cmp.key_cache[0].shape[1]} "
+                    f"!= len(token_ids)={len(c.token_ids)}"
+                )
             kv_zip._cache[c.chunk_id] = to_kvstore_entry(cmp)
         # ensure query chunk (last) is precomputed-fresh
         kv_zip._cache[chunks[-1].chunk_id] = kv_nozip.get(chunks[-1].chunk_id)
@@ -262,6 +268,12 @@ def main() -> int:
               f"CB(t={timings_cb.get('_total_ms', 0):.0f}: {cb_parts})  "
               f"CP(t={timings_compblend.get('_total_ms', 0):.0f}: {cp_parts})",
               flush=True)
+      except Exception as exc:
+        import traceback as _tb
+        print(f"[Q{idx+1} FAILED] {type(exc).__name__}: {exc}", flush=True)
+        _tb.print_exc()
+        if device.type == "cuda": torch.cuda.empty_cache()
+        continue
 
     # Aggregate
     def _stat(xs):

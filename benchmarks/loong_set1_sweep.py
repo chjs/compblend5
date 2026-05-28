@@ -352,6 +352,7 @@ def main() -> int:
             f1_arms[(r, f"gate={g}")] = []
 
     for idx, ex in enumerate(eval_dataset):
+      try:
         # Build prompt parts. Loong template = '{docs}\n\n{instruction}\n\n{question}'.
         # We chunk by: sys (empty) + each doc + query (instruction+question wrapped).
         query_text = f"\n\n{ex['instruction']}\n\n{ex['question']}{assistant_open}"
@@ -460,6 +461,12 @@ def main() -> int:
             ),
             flush=True,
         )
+      except Exception as exc:
+        import traceback as _tb
+        print(f"[Q{idx+1} FAILED] {type(exc).__name__}: {exc}", flush=True)
+        _tb.print_exc()
+        if device.type == "cuda": torch.cuda.empty_cache()
+        continue
 
     # aggregate
     def _mean(xs): return float(np.mean(xs)) if xs else float("nan")
