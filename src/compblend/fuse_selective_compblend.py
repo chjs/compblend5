@@ -223,7 +223,11 @@ def _build_attn_mask_with_per_head_valid(
     # have K/V=0 (zero-filled at chunk build time), so they contribute very
     # little to attention output through softmax × V. Documented limitation
     # of Stage 1 — Stage 2 will use flash_attn_varlen to handle this exactly.
-    ATTN_MASK_MEMORY_CAP_BYTES = 256 * 1024 ** 2       # 256 MB (aggressive cap for long ctx)
+    # Env override: set COMPBLEND_ATTN_MASK_CAP_MB to raise the cap (e.g. 32768
+    # for 32 GB). Used to verify that per-head mask fallback is the root cause
+    # of long-context F1 collapse. Production should use FlexAttention (Stage 2).
+    import os as _os
+    ATTN_MASK_MEMORY_CAP_BYTES = int(_os.environ.get("COMPBLEND_ATTN_MASK_CAP_MB", "256")) * 1024 ** 2
     bytes_per_elem = mask_dtype.itemsize if hasattr(mask_dtype, "itemsize") else 2
     Q = int(top_indices.numel())
     K = int(total_seq)
