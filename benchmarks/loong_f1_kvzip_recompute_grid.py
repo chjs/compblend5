@@ -220,6 +220,9 @@ def _resolve_wrapper(model_id: str) -> tuple[str, str]:
     raise RuntimeError(f"add wrapper for {model_id}")
 
 
+MAX_DOC_TOKENS_FOR_KVZIP = int(os.environ.get("COMPBLEND_MAX_DOC_TOKENS", "16000"))
+
+
 def _build_chunks(tokenizer, user_open: str, doc_contents: list[str], query_suffix: str):
     """Per-chunk independent tokenization. BPE merges across boundaries break I1
     — caller should skip such questions rather than feed mismatched ids to KVzip.
@@ -239,9 +242,23 @@ def _build_chunks(tokenizer, user_open: str, doc_contents: list[str], query_suff
         pref_ids = [bos] + pref_ids
     chunks.append(Chunk(text=user_open, token_ids=pref_ids, chunk_id=_stable_id(user_open, pref_ids)))
 
+    # Split large docs to keep each KVzip.compress call within scoring-task tolerance.
     for d_text in doc_contents:
         d_ids = tokenizer(d_text, add_special_tokens=False)["input_ids"]
-        chunks.append(Chunk(text=d_text, token_ids=d_ids, chunk_id=_stable_id(d_text, d_ids)))
+        if len(d_ids) <= MAX_DOC_TOKENS_FOR_KVZIP:
+            chunks.append(Chunk(text=d_text, token_ids=d_ids, chunk_id=_stable_id(d_text, d_ids)))
+        else:
+            n_sub = (len(d_ids) + MAX_DOC_TOKENS_FOR_KVZIP - 1) // MAX_DOC_TOKENS_FOR_KVZIP
+            sub_size = (len(d_ids) + n_sub - 1) // n_sub
+            for k in range(n_sub):
+                s = k * sub_size
+                e = min((k + 1) * sub_size, len(d_ids))
+                sub_ids = d_ids[s:e]
+                sub_text = tokenizer.decode(sub_ids)
+                chunks.append(Chunk(
+                    text=sub_text, token_ids=sub_ids,
+                    chunk_id=_stable_id(sub_text, sub_ids),
+                ))
 
     suf_ids = tokenizer(query_suffix, add_special_tokens=False)["input_ids"]
     chunks.append(Chunk(text=query_suffix, token_ids=suf_ids, chunk_id=_stable_id(query_suffix, suf_ids)))
