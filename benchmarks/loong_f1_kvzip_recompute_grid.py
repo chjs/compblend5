@@ -504,9 +504,7 @@ def main() -> int:
             compressed_1p0 = {}
             for ci in compressible_idx:
                 c = chunks[ci]
-                assert_kvzip_roundtrip_token_ids(
-                    f"q{q_idx+1}_chunk{ci}", c.token_ids, backend.tokenizer,
-                )
+                # I2 no longer needed — backend passes ids directly to KVzip.
                 ids = torch.tensor([c.token_ids], dtype=torch.long, device=device)
                 cmp = backend.compress(ids, model=hf_model, budget=CompressionBudget(ratio=1.0))
                 assert_compressed_storage_matches_tokens(f"q{q_idx+1}_chunk{ci}", cmp, c.token_ids)

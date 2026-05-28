@@ -185,8 +185,14 @@ class KVzipBackend(CompressionBackendBase):
         handles = self._install_hooks(mk, pre_rope_k_all, pre_v_all)
 
         try:
-            text = self._ids_to_text(mk, input_ids)
-            kv = mk.prefill(text, load_score=False, do_score=True)
+            # KVzip's `prefill(ctx_ids: Union[str, torch.Tensor])` accepts a
+            # tensor directly — avoid the decode→encode roundtrip that broke
+            # for tokenizer-unstable Loong docs.
+            ids = input_ids
+            if ids.dim() == 1:
+                ids = ids.unsqueeze(0)
+            ids = ids.to(mk.model.device)
+            kv = mk.prefill(ids, load_score=False, do_score=True)
         finally:
             for h in handles:
                 h.remove()

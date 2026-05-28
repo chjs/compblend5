@@ -465,10 +465,7 @@ def main() -> int:
                     if i in structural_idx:
                         kv_zip._cache[c.chunk_id] = kv_nozip.get(c.chunk_id)
                         continue
-                    assert_kvzip_roundtrip_token_ids(
-                        f"loong_q{idx + 1}_kr{kr}_chunk{i}",
-                        c.token_ids, backend.tokenizer,
-                    )
+                    # I2 no longer needed — backend now passes ids directly to KVzip.
                     ids = torch.tensor([c.token_ids], dtype=torch.long, device=device)
                     cmp = backend.compress(
                         ids, model=hf_model, budget=CompressionBudget(ratio=kr),
