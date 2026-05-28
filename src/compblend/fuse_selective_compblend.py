@@ -205,14 +205,13 @@ def _flex_attention_per_head_valid(
 ) -> torch.Tensor:
     """Per-head per-position valid mask via FlexAttention BlockMask.
 
-    Replaces the dense [1, H_q, Q, K] additive mask with FlexAttention's
-    block-sparse representation. Memory: tens of MB (block-level sparsity)
-    instead of GBs. Per-head mask is NATIVE in FlexAttention (no fallback).
-
-    Mask semantics:
-      attend iff
-        causal: global_pos(q_local) >= kv_global
-        AND (kv_global ∈ top_indices OR valid_layer[map_h(h_q), kv_global])
+    Trick: we project the sparse-Q causal+valid mask into a DENSE form
+    indexed by (h_q, q_local, kv_global). Concretely we build a precomputed
+    bool tensor of shape [H_q, Q, K] and let the mask_mod just index into it
+    by (h, q, kv). The bool tensor itself is small (typically tens of MB)
+    because FlexAttention only materializes blocks where the mask varies —
+    OR the [H_q, Q, K] tensor must fit anyway. For the kept sparse Q this
+    is feasible.
 
     Requires PyTorch 2.5+. Caller must check _FLEX_AVAILABLE.
     """
@@ -223,26 +222,33 @@ def _flex_attention_per_head_valid(
     _, _, K, _ = k.shape
     device = q.device
 
-    # Move static tensors to device (closure captures).
-    top_indices = top_indices.to(device).contiguous()
-    valid_layer = valid_layer.to(device).contiguous()
-    is_top = is_top.to(device).contiguous()
+    top_indices = top_indices.to(device, dtype=torch.long).contiguous()
+    valid_layer = valid_layer.to(device, dtype=torch.bool).contiguous()
+    is_top = is_top.to(device, dtype=torch.bool).contiguous()
 
+    # Combine per-head valid + is_top override → [H_q, K] (GQA-expanded).
+    valid_hq_k = valid_layer.repeat_interleave(n_rep, dim=0) | is_top.unsqueeze(0)
+
+    # FlexAttention's mask_mod must accept scalar (b, h, q_local, kv_global)
+    # and return a scalar bool. We use vmap-safe tensor indexing.
     def mask_mod(b, h, q_local, kv_global):
-        # Map local Q index to global position
         q_global = top_indices[q_local]
-        # Causal: q can attend to positions ≤ itself
         causal = q_global >= kv_global
-        # Per-head valid: kv_global is valid if it's in top_indices (override)
-        # OR the per-head valid_mask retains it.
-        h_kv = h // n_rep
-        valid = valid_layer[h_kv, kv_global] | is_top[kv_global]
+        valid = valid_hq_k[h, kv_global]
         return causal & valid
 
-    block_mask = _create_block_mask(
-        mask_mod, B=B, H=H_q, Q_LEN=Q, KV_LEN=K, device=device,
-    )
-    return _flex_attention(q, k, v, block_mask=block_mask, scale=scale)
+    try:
+        block_mask = _create_block_mask(
+            mask_mod, B=B, H=H_q, Q_LEN=Q, KV_LEN=K, device=device,
+        )
+        return _flex_attention(q, k, v, block_mask=block_mask, scale=scale)
+    except Exception as exc:
+        # FlexAttention has known limitations with closure tensor lookups under vmap.
+        # Fall back to SDPA additive mask path for this call.
+        import sys as _sys
+        print(f"[flex_attention fallback to SDPA] {type(exc).__name__}: {exc}",
+              file=_sys.stderr, flush=True)
+        raise
 
 
 def _build_attn_mask_with_per_head_valid(
