@@ -56,6 +56,7 @@ LOONG_JSONL = Path(os.environ.get(
 ))
 LOONG_LEVELS = [int(x) for x in os.environ.get("LOONG_LEVELS", "1,2").split(",")]
 LOONG_SETS = [int(x) for x in os.environ.get("LOONG_SETS", "2").split(",")]
+LOONG_MAX_LENGTH = int(os.environ.get("LOONG_MAX_LENGTH", "32000"))  # safety cap for OOM
 OUT_PATH = Path(os.environ.get("COMPBLEND_OUT", str(_REPO / "logs" / "loong_set1_sweep.json")))
 MAX_NEW_TOKENS = 64    # Loong answers can be slightly longer than MuSiQue's
 
@@ -173,6 +174,7 @@ def _load_loong_questions(
             if d["set"] not in set_ids: continue
             if d["language"] != language: continue
             if not isinstance(d["answer"], str): continue
+            if d.get("length", 0) > LOONG_MAX_LENGTH: continue
             rows.append(d)
     print(f"[loong] filtered to {len(rows)} rows "
           f"(levels={levels}, sets={set_ids}, lang={language}, answer=str)", flush=True)

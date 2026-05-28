@@ -183,16 +183,24 @@ def _build_attn_mask_with_per_head_valid(
     # have K/V=0 (zero-filled at chunk build time), so they contribute very
     # little to attention output through softmax × V. Documented limitation
     # of Stage 1 — Stage 2 will use flash_attn_varlen to handle this exactly.
-    ATTN_MASK_MEMORY_CAP_BYTES = 2 * 1024 ** 3       # 2 GB
+    ATTN_MASK_MEMORY_CAP_BYTES = 256 * 1024 ** 2       # 256 MB (aggressive cap for long ctx)
     bytes_per_elem = mask_dtype.itemsize if hasattr(mask_dtype, "itemsize") else 2
     Q = int(top_indices.numel())
     K = int(total_seq)
     H_q = int(valid_layer.shape[0]) * int(n_rep)
     mask_bytes = 1 * H_q * Q * K * bytes_per_elem
     if mask_bytes > ATTN_MASK_MEMORY_CAP_BYTES:
-        # Print only once per call site (cheap repeated check, but spamming
-        # log is bad). Caller knows from output shape that fallback happened
-        # iff the returned mask is `sparse_causal` (4-dim with size 1 at H).
+        # Fallback: causal-only mask. Evicted positions still contribute
+        # near-zero (zero-filled K/V × softmax). Print fallback once-per-call
+        # so the log shows we're not silently mis-attending.
+        import sys as _sys
+        print(
+            f"[fuser] per-head mask too large "
+            f"({mask_bytes / 1024 ** 2:.0f}MB > "
+            f"{ATTN_MASK_MEMORY_CAP_BYTES / 1024 ** 2:.0f}MB cap) — "
+            f"fallback to causal-only at Q={Q}, K={K}, H={H_q}",
+            file=_sys.stderr, flush=True,
+        )
         return sparse_causal
 
     # Step 3: additive form. 0 where valid, -inf where evicted.
