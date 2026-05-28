@@ -173,6 +173,28 @@ def _build_attn_mask_with_per_head_valid(
         # No per-head eviction — sparse_causal alone is correct.
         return sparse_causal
 
+    # Memory guard: at long context the full [1, H_q, Q, K] mask exceeds GPU
+    # memory. Mask size = H_q × Q × K × bytes. For Llama-3.1-8B (H_q=32),
+    # recompute=0.15, total_seq=80K: 32 × 12000 × 80000 × 2 = 61 GB. OOM.
+    #
+    # Fall back to causal-only when the per-head mask would exceed
+    # ATTN_MASK_MEMORY_CAP_BYTES. Quality cost: KVzip's per-head eviction
+    # pattern is not enforced at SDPA. Mitigated because evicted positions
+    # have K/V=0 (zero-filled at chunk build time), so they contribute very
+    # little to attention output through softmax × V. Documented limitation
+    # of Stage 1 — Stage 2 will use flash_attn_varlen to handle this exactly.
+    ATTN_MASK_MEMORY_CAP_BYTES = 2 * 1024 ** 3       # 2 GB
+    bytes_per_elem = mask_dtype.itemsize if hasattr(mask_dtype, "itemsize") else 2
+    Q = int(top_indices.numel())
+    K = int(total_seq)
+    H_q = int(valid_layer.shape[0]) * int(n_rep)
+    mask_bytes = 1 * H_q * Q * K * bytes_per_elem
+    if mask_bytes > ATTN_MASK_MEMORY_CAP_BYTES:
+        # Print only once per call site (cheap repeated check, but spamming
+        # log is bad). Caller knows from output shape that fallback happened
+        # iff the returned mask is `sparse_causal` (4-dim with size 1 at H).
+        return sparse_causal
+
     # Step 3: additive form. 0 where valid, -inf where evicted.
     # Cast carefully — sparse_causal is in model dtype (fp16/bf16/fp32).
     neg_inf = torch.tensor(float("-inf"), dtype=mask_dtype, device=valid_eff.device)
