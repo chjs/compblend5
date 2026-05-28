@@ -25,6 +25,7 @@ when v7 changes:
 """
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
@@ -32,6 +33,18 @@ import torch
 import torch.nn.functional as F
 from torch.nn.functional import scaled_dot_product_attention as _sdpa
 from transformers.cache_utils import DynamicCache
+
+# FlexAttention import is optional (PyTorch 2.5+ beta, 2.6+ stable).
+try:
+    from torch.nn.attention.flex_attention import (
+        flex_attention as _flex_attention,
+        create_block_mask as _create_block_mask,
+    )
+    _FLEX_AVAILABLE = True
+except ImportError:
+    _flex_attention = None
+    _create_block_mask = None
+    _FLEX_AVAILABLE = False
 
 
 class _Timer:
@@ -177,6 +190,59 @@ def _select_recompute_indices(
         )
 
     raise ValueError(f"unknown selector: {config.selector!r}")
+
+
+def _flex_attention_per_head_valid(
+    q: torch.Tensor,              # [1, H_q, Q, D] (sparse Q)
+    k: torch.Tensor,              # [1, H_q, K, D] (full K, evicted slots zero-filled)
+    v: torch.Tensor,              # [1, H_q, K, D]
+    *,
+    top_indices: torch.Tensor,    # [Q] int64 — global positions of sparse Q
+    valid_layer: torch.Tensor,    # [H_kv, K] bool — per-head per-position validity
+    is_top: torch.Tensor,         # [K] bool — True at top_indices (always-valid override)
+    n_rep: int,                   # H_q // H_kv (GQA)
+    scale: float,
+) -> torch.Tensor:
+    """Per-head per-position valid mask via FlexAttention BlockMask.
+
+    Replaces the dense [1, H_q, Q, K] additive mask with FlexAttention's
+    block-sparse representation. Memory: tens of MB (block-level sparsity)
+    instead of GBs. Per-head mask is NATIVE in FlexAttention (no fallback).
+
+    Mask semantics:
+      attend iff
+        causal: global_pos(q_local) >= kv_global
+        AND (kv_global ∈ top_indices OR valid_layer[map_h(h_q), kv_global])
+
+    Requires PyTorch 2.5+. Caller must check _FLEX_AVAILABLE.
+    """
+    if not _FLEX_AVAILABLE:
+        raise RuntimeError("FlexAttention not available; install PyTorch 2.5+")
+
+    B, H_q, Q, D = q.shape
+    _, _, K, _ = k.shape
+    device = q.device
+
+    # Move static tensors to device (closure captures).
+    top_indices = top_indices.to(device).contiguous()
+    valid_layer = valid_layer.to(device).contiguous()
+    is_top = is_top.to(device).contiguous()
+
+    def mask_mod(b, h, q_local, kv_global):
+        # Map local Q index to global position
+        q_global = top_indices[q_local]
+        # Causal: q can attend to positions ≤ itself
+        causal = q_global >= kv_global
+        # Per-head valid: kv_global is valid if it's in top_indices (override)
+        # OR the per-head valid_mask retains it.
+        h_kv = h // n_rep
+        valid = valid_layer[h_kv, kv_global] | is_top[kv_global]
+        return causal & valid
+
+    block_mask = _create_block_mask(
+        mask_mod, B=B, H=H_q, Q_LEN=Q, KV_LEN=K, device=device,
+    )
+    return _flex_attention(q, k, v, block_mask=block_mask, scale=scale)
 
 
 def _build_attn_mask_with_per_head_valid(
@@ -704,29 +770,48 @@ def fuse_selective_compblend(
 
         past_key_values.update(k_full_post, v_mixed_heads, config.check_layer)
 
-        # CompBlend extension: per-head valid_mask in SDPA attn_mask.
+        # CompBlend extension: per-head valid_mask via SDPA additive mask OR FlexAttention.
         if flags is not None:
             flags["_check_layer_idx"] = int(config.check_layer)
-        attn_mask_ck = _build_attn_mask_with_per_head_valid(
-            causal_mask_full=causal_mask_full,
-            top_indices=top_indices,
-            total_seq=total_seq,
-            valid_layer=valid_mask_full[config.check_layer],
-            is_top=is_top,
-            n_rep=n_rep,
-            mask_dtype=causal_mask_full.dtype,
-            flags=flags,
-        )
-        timer.mark("check_attn_mask_build")
 
-        # GQA expansion of K/V.
+        use_flex = (
+            os.environ.get("COMPBLEND_USE_FLEX_ATTENTION", "0") == "1"
+            and _FLEX_AVAILABLE
+        )
+        # GQA expansion of K/V (common to both paths).
         k_rep = k_full_post.repeat_interleave(n_rep, dim=1)
         v_rep = v_mixed_heads.repeat_interleave(n_rep, dim=1)
-        attn_out_ck = _sdpa(
-            q_sparse_post, k_rep, v_rep,
-            attn_mask=attn_mask_ck,
-            scale=attn_ck.scaling,
-        )
+
+        if use_flex:
+            if flags is not None:
+                flags["attention_backend"] = "flex_attention"
+                flags["per_head_mask_required"] = True
+                flags.setdefault("per_head_mask_exact_layers", []).append(int(config.check_layer))
+            timer.mark("check_attn_mask_build")
+            attn_out_ck = _flex_attention_per_head_valid(
+                q_sparse_post, k_rep, v_rep,
+                top_indices=top_indices,
+                valid_layer=valid_mask_full[config.check_layer],
+                is_top=is_top, n_rep=n_rep,
+                scale=attn_ck.scaling,
+            )
+        else:
+            attn_mask_ck = _build_attn_mask_with_per_head_valid(
+                causal_mask_full=causal_mask_full,
+                top_indices=top_indices,
+                total_seq=total_seq,
+                valid_layer=valid_mask_full[config.check_layer],
+                is_top=is_top,
+                n_rep=n_rep,
+                mask_dtype=causal_mask_full.dtype,
+                flags=flags,
+            )
+            timer.mark("check_attn_mask_build")
+            attn_out_ck = _sdpa(
+                q_sparse_post, k_rep, v_rep,
+                attn_mask=attn_mask_ck,
+                scale=attn_ck.scaling,
+            )
         attn_out_ck = attn_out_ck.transpose(1, 2).reshape(
             1, topk_num, num_heads * head_dim,
         ).contiguous()
@@ -802,25 +887,38 @@ def fuse_selective_compblend(
             # Per-head mask for this layer (mirrors check_layer).
             if flags is not None:
                 flags["_sparse_layer_idx"] = int(li)
-            attn_mask_li = _build_attn_mask_with_per_head_valid(
-                causal_mask_full=causal_mask_full,
-                top_indices=top_indices,
-                total_seq=total_seq,
-                valid_layer=valid_mask_full[li],
-                is_top=is_top,
-                n_rep=n_rep,
-                mask_dtype=causal_mask_full.dtype,
-                flags=flags,
-            )
-            timer.mark("sparse_attn_mask_build")
 
             k_rep_li = k_full_li.repeat_interleave(n_rep, dim=1)
             v_rep_li = v_full_li.repeat_interleave(n_rep, dim=1)
-            attn_out_li = _sdpa(
-                q_sparse_post, k_rep_li, v_rep_li,
-                attn_mask=attn_mask_li,
-                scale=attn_li.scaling,
-            )
+
+            if use_flex:
+                if flags is not None:
+                    flags.setdefault("per_head_mask_exact_layers", []).append(int(li))
+                timer.mark("sparse_attn_mask_build")
+                attn_out_li = _flex_attention_per_head_valid(
+                    q_sparse_post, k_rep_li, v_rep_li,
+                    top_indices=top_indices,
+                    valid_layer=valid_mask_full[li],
+                    is_top=is_top, n_rep=n_rep,
+                    scale=attn_li.scaling,
+                )
+            else:
+                attn_mask_li = _build_attn_mask_with_per_head_valid(
+                    causal_mask_full=causal_mask_full,
+                    top_indices=top_indices,
+                    total_seq=total_seq,
+                    valid_layer=valid_mask_full[li],
+                    is_top=is_top,
+                    n_rep=n_rep,
+                    mask_dtype=causal_mask_full.dtype,
+                    flags=flags,
+                )
+                timer.mark("sparse_attn_mask_build")
+                attn_out_li = _sdpa(
+                    q_sparse_post, k_rep_li, v_rep_li,
+                    attn_mask=attn_mask_li,
+                    scale=attn_li.scaling,
+                )
             attn_out_li = attn_out_li.transpose(1, 2).reshape(
                 1, topk_num, num_heads * head_dim,
             ).contiguous()
