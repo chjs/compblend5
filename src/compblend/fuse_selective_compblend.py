@@ -25,12 +25,46 @@ when v7 changes:
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch.nn.functional import scaled_dot_product_attention as _sdpa
 from transformers.cache_utils import DynamicCache
+
+
+class _Timer:
+    """Lightweight per-section timer using torch.cuda.synchronize.
+
+    `mark(label)` adds the elapsed time since the previous mark/start to
+    a running total under that label. Sections that occur inside loops
+    (e.g. per-layer sparse forward) get summed automatically.
+
+    Zero overhead when `enabled=False` — both start() and mark() short-circuit.
+    """
+
+    def __init__(self, enabled: bool, device: torch.device) -> None:
+        self.enabled = enabled
+        self.device = device
+        self.events: dict[str, float] = {}
+        self.last: float | None = None
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        self.last = time.perf_counter()
+
+    def mark(self, label: str) -> None:
+        if not self.enabled or self.last is None:
+            return
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        now = time.perf_counter()
+        self.events[label] = self.events.get(label, 0.0) + (now - self.last) * 1000.0
+        self.last = now
 
 from cacheblend.chunker import Chunk, chunk_offsets, fused_input_ids
 from cacheblend.hkvd import kv_deviation
@@ -319,6 +353,7 @@ def fuse_selective_compblend(
     config: CompBlendConfig,
     return_layerwise_output: bool = False,
     return_hkvd_indices: bool = False,
+    timings: dict | None = None,
 ):
     """Paper §4 selective recompute + paper §3 Gated HKVD + per-head mask.
 
@@ -384,6 +419,10 @@ def fuse_selective_compblend(
     hidden_kv = num_kv_heads * head_dim
     n_rep = num_heads // num_kv_heads
 
+    # Instrumentation (zero overhead when timings is None)
+    timer = _Timer(enabled=(timings is not None), device=device)
+    timer.start()
+
     if not (0 <= config.check_layer < n_layers):
         raise ValueError(
             f"check_layer={config.check_layer} out of range [0, {n_layers})"
@@ -443,6 +482,7 @@ def fuse_selective_compblend(
         # chunk has no valid_mask key (sys/query precompute), `_load_chunk_
         # extensions` set it all-True → union is all-True too.
         eligible_full[start:end] = chunk_valid[config.check_layer].any(dim=0)
+    timer.mark("kv_load")
 
     # ── Forward setup ──────────────────────────────────────────────────
     input_ids = fused_input_ids(chunks, device=device)
@@ -459,6 +499,7 @@ def fuse_selective_compblend(
         hidden_states = inner.embed_tokens(input_ids)
         cos_full, sin_full = inner.rotary_emb(hidden_states, position_ids_full)
         position_embeddings_full = (cos_full, sin_full)
+        timer.mark("io_embed_rotary")
 
         causal_mask_full = inner._update_causal_mask(
             attention_mask=None,
@@ -485,6 +526,7 @@ def fuse_selective_compblend(
             position_ids_full, position_embeddings_full, cache_position_full,
             past_key_values, layer_range=range(config.check_layer),
         )
+        timer.mark("full_prefix")
 
         # ── Layer check_layer: HKVD + selector + sparse slice ───────────
         layer_ck = inner.layers[config.check_layer]
@@ -525,6 +567,7 @@ def fuse_selective_compblend(
 
         is_top = torch.zeros(total_seq, dtype=torch.bool, device=device)
         is_top[top_indices] = True
+        timer.mark("hkvd_select")
 
         # Mixed K_pre, V: cached at non-top, fresh at top.
         k_mixed_pre = k_full_pre.clone()
@@ -580,6 +623,7 @@ def fuse_selective_compblend(
         h_sparse_normed = layer_ck.post_attention_layernorm(h_sparse)
         h_sparse = layer_ck.mlp(h_sparse_normed)
         h_sparse = residual_sparse2 + h_sparse
+        timer.mark("check_layer")
 
         # ── Layers check_layer+1..n_layers-1: sparse hidden, mixed K/V ──
         cos_sparse = cos_full[:, top_indices, :]
@@ -653,6 +697,7 @@ def fuse_selective_compblend(
             h_sparse_normed = layer_li.post_attention_layernorm(h_sparse)
             h_sparse = layer_li.mlp(h_sparse_normed)
             h_sparse = residual_sparse_in2 + h_sparse
+        timer.mark("sparse_layers")
 
         # ── Final norm + lm_head on SPARSE hidden ──────────────────────
         h_sparse_normed = inner.norm(h_sparse)
@@ -664,6 +709,12 @@ def fuse_selective_compblend(
             dtype=logits_sparse.dtype, device=device,
         )
         logits_full[:, top_indices, :] = logits_sparse
+        timer.mark("lmhead")
+
+    # Stash timing events on the caller's dict (if provided)
+    if timings is not None:
+        timings.update(timer.events)
+        timings["_total_ms"] = sum(timer.events.values())
 
     out_obj = LayerwiseOutput(logits=logits_full, past_key_values=past_key_values)
     result = out_obj if return_layerwise_output else logits_full
