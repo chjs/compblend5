@@ -244,29 +244,54 @@ class KVzipBackend(CompressionBackendBase):
         sink_ctx: int,
         proj_name: str,
     ) -> dict[int, torch.Tensor]:
-        """Pick the prefill capture per layer by matching `shape[1] == sink_ctx`.
+        """Pick the prefill K/V per layer. Handles single AND chunked prefill.
 
-        Among captures per layer, the prefill is the one whose K spans the
-        full [sink, sink+ctx_len) region. KVzip's scoring task uses a
-        different (typically shorter) sequence, so its captures have a
-        different shape[1] and are filtered out here.
+        KVzip's prefill behavior depends on context length:
+          * Short context (≤ chunk_size, typ. 16K): one capture with
+            shape[1] == sink + ctx_len. We pick that single tensor.
+          * Long context (> chunk_size): KVzip processes the prompt in
+            multiple chunks (e.g. 16000, 16000, 7985 for 39985-token
+            prefill). Each chunk's k_proj fires a separate hook. The
+            scoring task that follows uses a different (typically
+            shorter) sequence. We identify the prefill chunks as the
+            FIRST `k` captures whose shape[1] sums to sink + ctx_len,
+            then `torch.cat(..., dim=1)` them into a single tensor.
 
-        If multiple captures match (rare — would mean the model was
-        re-prefilled), we take the FIRST: prefill chronologically precedes
-        scoring, and `setdefault.append` preserves call order.
+        Fails loudly if neither path can reconstruct sink_ctx — e.g. if
+        the scoring task's captures got interleaved with prefill.
         """
         out: dict[int, torch.Tensor] = {}
         for layer_idx, caps in captures_all.items():
-            matches = [t for t in caps if t.shape[1] == sink_ctx]
-            if not matches:
-                shapes = [tuple(t.shape) for t in caps]
-                raise RuntimeError(
-                    f"No {proj_name} capture at layer {layer_idx} with "
-                    f"shape[1]={sink_ctx} (sink+ctx_len). Captured shapes: "
-                    f"{shapes}. The hook plumbing or KVzip's prefill flow "
-                    f"changed; can no longer locate the prefill forward."
-                )
-            out[layer_idx] = matches[0]
+            # Path 1: single-capture match (short context).
+            single = [t for t in caps if t.shape[1] == sink_ctx]
+            if single:
+                out[layer_idx] = single[0]
+                continue
+
+            # Path 2: chunked-prefill concat. Walk forward through captures
+            # accumulating shape[1] until we hit sink_ctx exactly.
+            running = 0
+            chunks: list[torch.Tensor] = []
+            for t in caps:
+                chunks.append(t)
+                running += int(t.shape[1])
+                if running == sink_ctx:
+                    break
+                if running > sink_ctx:
+                    chunks = []      # overshot — sequence didn't match
+                    break
+
+            if running == sink_ctx and chunks:
+                out[layer_idx] = torch.cat(chunks, dim=1).contiguous()
+                continue
+
+            shapes = [tuple(t.shape) for t in caps]
+            raise RuntimeError(
+                f"Could not reconstruct {proj_name} prefill at layer {layer_idx}. "
+                f"Target shape[1]={sink_ctx} (sink+ctx_len). Tried: single-match "
+                f"(none); chunked-concat (running sum did not match). Captured "
+                f"shapes: {shapes}"
+            )
         return out
 
     def _build_chunk(
