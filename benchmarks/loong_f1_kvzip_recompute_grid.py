@@ -221,32 +221,38 @@ def _resolve_wrapper(model_id: str) -> tuple[str, str]:
 
 
 def _build_chunks(tokenizer, user_open: str, doc_contents: list[str], query_suffix: str):
-    """Slice from full tokenization → concat(c.token_ids) == tokenize(full)."""
+    """Per-chunk independent tokenization. BPE merges across boundaries break I1
+    — caller should skip such questions rather than feed mismatched ids to KVzip.
+
+    KVzip's mk.prefill(text) internally re-tokenizes; for the stored K/V to
+    correspond to OUR chunk.token_ids, decode(chunk_ids)→encode must be the
+    identity. Full-slice tokenization fails this for boundary-merged tokens
+    (e.g. \"\\n\\n\"+\"\\n\\n\" → 1 token whose decode is 4 newlines but whose
+    re-encode might split differently in a non-trivial context).
+    """
     from cacheblend.chunker import Chunk, _stable_id
     bos = tokenizer.bos_token_id
-    segments = [user_open] + list(doc_contents) + [query_suffix]
-    full_text = "".join(segments)
-    full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
-    if bos is not None:
-        full_ids = [bos] + full_ids
-    bos_offset = 1 if bos is not None else 0
-
-    boundaries = [bos_offset]
-    cumulative = ""
-    for seg in segments:
-        cumulative += seg
-        n = len(tokenizer(cumulative, add_special_tokens=False)["input_ids"])
-        boundaries.append(bos_offset + n)
-
     chunks = []
-    for i, seg in enumerate(segments):
-        s = 0 if i == 0 else boundaries[i]
-        e = boundaries[i + 1]
-        ids = full_ids[s:e]
-        chunks.append(Chunk(text=seg, token_ids=ids, chunk_id=_stable_id(seg, ids)))
+
+    pref_ids = tokenizer(user_open, add_special_tokens=False)["input_ids"]
+    if bos is not None:
+        pref_ids = [bos] + pref_ids
+    chunks.append(Chunk(text=user_open, token_ids=pref_ids, chunk_id=_stable_id(user_open, pref_ids)))
+
+    for d_text in doc_contents:
+        d_ids = tokenizer(d_text, add_special_tokens=False)["input_ids"]
+        chunks.append(Chunk(text=d_text, token_ids=d_ids, chunk_id=_stable_id(d_text, d_ids)))
+
+    suf_ids = tokenizer(query_suffix, add_special_tokens=False)["input_ids"]
+    chunks.append(Chunk(text=query_suffix, token_ids=suf_ids, chunk_id=_stable_id(query_suffix, suf_ids)))
 
     structural_idx = [0, len(chunks) - 1]
     compressible_idx = list(range(1, len(chunks) - 1))
+    # full_ids for I1 reference: tokenize full prompt (with BOS) independently.
+    full_text = user_open + "".join(doc_contents) + query_suffix
+    full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
+    if bos is not None:
+        full_ids = [bos] + full_ids
     return chunks, structural_idx, compressible_idx, full_ids
 
 

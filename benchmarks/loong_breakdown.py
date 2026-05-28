@@ -120,45 +120,33 @@ def _build_chunks(
         chunks[1..N]   : doc chunks         = one per doc       (compressed)
         chunks[N+1]    : structural suffix  = query_suffix      (uncompressed)
 
-    Tokenization policy (CRITICAL for invariant I1):
-      We tokenize the ENTIRE concatenated prompt once, then slice the full
-      token list at segment boundaries computed via cumulative prefix lengths
-      (in characters → tokens). This guarantees by construction:
-          concat(c.token_ids for c in chunks) == tokenize(full_prompt)
-      even when BPE merges across chunk boundaries (e.g. "\\n\\n" + "\\n\\n"
-      → single token "\\n\\n\\n\\n"). The previous per-chunk tokenize was
-      broken: it produced 2 tokens for the 2× "\\n\\n" pieces whereas the
-      full prompt produces 1 merged token.
+    Tokenization policy:
+      Each chunk is tokenized INDEPENDENTLY (add_special_tokens=False), BOS
+      prepended to chunks[0] explicitly. This preserves KVzip's
+      decode→encode roundtrip identity for each chunk individually — the
+      cached K/V actually corresponds to the chunk's token sequence.
+
+      Trade-off: concat(c.token_ids) may diverge from tokenize(full_prompt)
+      at BPE-merge boundaries (e.g. "\\n\\n"+"\\n\\n" → 1 token in full,
+      2 tokens in concat). The caller's I1 invariant flags such questions
+      so they can be skipped rather than producing apples-to-oranges
+      timing comparisons.
     """
     from cacheblend.chunker import Chunk, _stable_id
     bos = tokenizer.bos_token_id
-
-    segments = [user_open] + list(doc_contents) + [query_suffix]
-    full_text = "".join(segments)
-    full_ids = tokenizer(full_text, add_special_tokens=False)["input_ids"]
-    if bos is not None:
-        full_ids = [bos] + full_ids
-
-    bos_offset = 1 if bos is not None else 0
-
-    # Boundary token indices via cumulative-prefix retokenization.
-    # boundaries[i] = number of tokens in tokenize("".join(segments[:i+1])),
-    # plus bos_offset. boundaries[0] = bos_offset (= start of segment 0 content
-    # in full_ids). boundaries[-1] = total length of full_ids.
-    boundaries = [bos_offset]
-    cumulative = ""
-    for seg in segments:
-        cumulative += seg
-        n_tokens = len(tokenizer(cumulative, add_special_tokens=False)["input_ids"])
-        boundaries.append(bos_offset + n_tokens)
-
     chunks = []
-    for i, seg in enumerate(segments):
-        # Include BOS at the start of the first chunk so chunk[0].token_ids[0] == BOS.
-        s = 0 if i == 0 else boundaries[i]
-        e = boundaries[i + 1]
-        ids = full_ids[s:e]
-        chunks.append(Chunk(text=seg, token_ids=ids, chunk_id=_stable_id(seg, ids)))
+
+    pref_ids = tokenizer(user_open, add_special_tokens=False)["input_ids"]
+    if bos is not None:
+        pref_ids = [bos] + pref_ids
+    chunks.append(Chunk(text=user_open, token_ids=pref_ids, chunk_id=_stable_id(user_open, pref_ids)))
+
+    for d_text in doc_contents:
+        d_ids = tokenizer(d_text, add_special_tokens=False)["input_ids"]
+        chunks.append(Chunk(text=d_text, token_ids=d_ids, chunk_id=_stable_id(d_text, d_ids)))
+
+    suf_ids = tokenizer(query_suffix, add_special_tokens=False)["input_ids"]
+    chunks.append(Chunk(text=query_suffix, token_ids=suf_ids, chunk_id=_stable_id(query_suffix, suf_ids)))
 
     structural_idx = [0, len(chunks) - 1]
     compressible_idx = list(range(1, len(chunks) - 1))
